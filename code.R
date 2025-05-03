@@ -306,40 +306,6 @@ cat("AUC:", auc_xgb, "\n")
 X_train_xgb <- as.matrix(X_train_full) 
 X_test_xgb <- as.matrix(X_test_full)
 
-# Create DMatrix objects for XGBoost
-dtrain <- xgb.DMatrix(data = X_train_xgb, label = y_train)
-dtest <- xgb.DMatrix(data = X_test_xgb, label = y_test)
-
-# Model parameters
-params <- list(
-  objective = "binary:logistic",
-  eval_metric = "auc"
-)
-
-# Train the model
-cat("\nTraining XGBoost model...\n")
-xgb_model <- xgb.train(
-  params = params,
-  data = dtrain,
-  nrounds = 100,
-  verbose = 0
-)
-
-# Make predictions
-pred_xgb <- predict(xgb_model, dtest)
-pred_class_xgb <- ifelse(pred_xgb > 0.5, "yes", "no")
-
-# Evaluate the model
-conf_mat_xgb <- confusionMatrix(as.factor(pred_class_xgb), y_test)
-roc_xgb <- roc(y_test_num, pred_xgb)
-auc_xgb <- auc(roc_xgb)
-
-# Display results
-cat("\nXGBoost Results:\n")
-print(conf_mat_xgb)
-cat("AUC:", auc_xgb, "\n")
-
-# Compare model performance
 # Compare model performance including XGBoost
 model_comparison <- data.frame(
   Model = c("Logistic Regression", "SVM", "Decision Tree", "XGBoost"),
