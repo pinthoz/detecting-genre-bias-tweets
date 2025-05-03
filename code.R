@@ -275,36 +275,125 @@ X_test_xgb <- as.matrix(X_test_full)
 dtrain <- xgb.DMatrix(data = X_train_xgb, label = y_train_num)
 dtest <- xgb.DMatrix(data = X_test_xgb, label = y_test_num)
 
-# Model parameters
-params <- list(
-  objective = "binary:logistic",
-  eval_metric = "auc"
+
+cat("\nStarting hyperparameter optimisation with cross-validation...\n")
+
+# List of parameters to test in cross-validation
+param_grid <- list(
+  max_depth = c(3, 5, 7),
+  eta = c(0.01, 0.05, 0.1),
+  gamma = c(0, 0.1, 0.3),
+  subsample = c(0.7, 0.8, 0.9),
+  colsample_bytree = c(0.7, 0.8, 0.9),
+  min_child_weight = c(1, 3, 5)
 )
 
-# Train the model
-cat("\nTraining XGBoost model...\n")
-xgb_model <- xgb.train(
-  params = params,
+# Function to evaluate a specific combination of parameters
+evaluate_params <- function(max_depth, eta, gamma, subsample, colsample_bytree, min_child_weight) {
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    max_depth = max_depth,
+    eta = eta,
+    gamma = gamma,
+    subsample = subsample,
+    colsample_bytree = colsample_bytree,
+    min_child_weight = min_child_weight
+  )
+  
+  cv_results <- xgb.cv(
+    params = params,
+    data = dtrain,
+    nrounds = 100,
+    nfold = 5,
+    early_stopping_rounds = 10,
+    verbose = 0
+  )
+  
+  # Return best AUC
+  best_auc <- max(cv_results$evaluation_log$test_auc_mean)
+  return(list(auc = best_auc, nrounds = which.max(cv_results$evaluation_log$test_auc_mean)))
+}
+
+# Initialise results
+results <- data.frame()
+
+# Limiting the number of combinations to save time
+# Randomly selecting some combinations
+set.seed(42)
+max_depth_vals <- sample(param_grid$max_depth, 2)
+eta_vals <- sample(param_grid$eta, 2)
+gamma_vals <- sample(param_grid$gamma, 2)
+subsample_vals <- sample(param_grid$subsample, 2)
+colsample_vals <- sample(param_grid$colsample_bytree, 2)
+min_child_vals <- sample(param_grid$min_child_weight, 2)
+
+# Reduced search grid
+for (depth in max_depth_vals) {
+  for (eta_val in eta_vals) {
+    for (gamma_val in gamma_vals) {
+      for (subsample_val in subsample_vals) {
+        for (colsample_val in colsample_vals) {
+          for (min_child_val in min_child_vals) {
+            cat("Evaluating: depth =", depth, "eta =", eta_val, "gamma =", gamma_val, "\n")
+            
+            result <- evaluate_params(depth, eta_val, gamma_val, subsample_val, colsample_val, min_child_val)
+            
+            results <- rbind(results, data.frame(
+              max_depth = depth,
+              eta = eta_val,
+              gamma = gamma_val,
+              subsample = subsample_val,
+              colsample_bytree = colsample_val,
+              min_child_weight = min_child_val,
+              auc = result$auc,
+              nrounds = result$nrounds
+            ))
+          }
+        }
+      }
+    }
+  }
+}
+
+# Find the best parameters
+best_params_idx <- which.max(results$auc)
+best_params <- results[best_params_idx, ]
+cat("\nBest parameters found:\n")
+print(best_params)
+
+# Train the final model with the best parameters
+final_params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  max_depth = best_params$max_depth,
+  eta = best_params$eta,
+  gamma = best_params$gamma,
+  subsample = best_params$subsample,
+  colsample_bytree = best_params$colsample_bytree,
+  min_child_weight = best_params$min_child_weight
+)
+
+# Train the final model
+xgb_final <- xgb.train(
+  params = final_params,
   data = dtrain,
-  nrounds = 100,
+  nrounds = best_params$nrounds,
   verbose = 0
 )
 
-# Make predictions
-pred_xgb <- predict(xgb_model, dtest)
+cat("\nEvaluating XGBoost...\n")
+pred_xgb <- predict(xgb_final, dtest)
 pred_class_xgb <- ifelse(pred_xgb > 0.5, "yes", "no")
-
-# Evaluate the model
 conf_mat_xgb <- confusionMatrix(as.factor(pred_class_xgb), y_test)
-roc_xgb <- roc(y_test_num, pred_xgb)
+roc_xgb <- roc(as.numeric(y_test == "yes"), pred_xgb)
 auc_xgb <- auc(roc_xgb)
 
 # Display results
 cat("\nXGBoost Results:\n")
 print(conf_mat_xgb)
 cat("AUC:", auc_xgb, "\n")
-X_train_xgb <- as.matrix(X_train_full) 
-X_test_xgb <- as.matrix(X_test_full)
+
 
 # Compare model performance including XGBoost
 model_comparison <- data.frame(
