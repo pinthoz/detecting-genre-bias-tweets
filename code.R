@@ -15,6 +15,9 @@ library(gridExtra)
 library(xgboost)
 library(caret)
 library(Matrix)
+library(themis)
+library(recipes)
+library(glmnet)
 
 # Load Data
 train_data <- read_csv("data/EXIST2025_train.csv")
@@ -89,8 +92,9 @@ print("Top 10 collocations:")
 print(head(collocations, 10))
 
 # Co-occurrence with context window
-fcmat <- fcm(tokens_clean, context = "window", window = 5)
-top_features <- names(topfeatures(fcmat, 30))
+dfmat <- dfm(tokens_clean)
+top_features_df <- textstat_frequency(dfmat, n = 30)
+top_features <- top_features_df$feature
 fcmat_top <- fcm_select(fcmat, pattern = top_features)
 
 # Visualize co-occurrence network
@@ -146,90 +150,107 @@ grid.arrange(p1, p2, p3, ncol=2)
 # Create document-feature matrix 
 dfm_tfidf <- dfm_tfidf(dfm_clean)
 
-# Handle duplicate tweets (same tweet annotated by multiple annotators)
+
 # Group by tweet and take majority vote for the label
 tweet_labels <- train_data %>%
   group_by(tweet) %>%
-  summarize(sexist = ifelse(mean(sexist == "yes") >= 0.5, "yes", "no"))
+  summarize(
+    sexist_ratio = mean(sexist == "yes"),
+    sexist = ifelse(sexist_ratio > 0.5, "yes", "no")  
+  ) %>%
+  filter(sexist_ratio != 0.5)
 
 
-# Create corpus from unique tweets
-unique_corpus <- corpus(tweet_labels$tweet)
+tweet_labels %>%
+  count(sexist) %>%
+  mutate(prop = n / sum(n))
 
-# Process unique tweets
-unique_tokens <- tokens(unique_corpus,
-                        remove_punct = TRUE,
-                        remove_symbols = TRUE,
-                        remove_numbers = TRUE) %>%
-  tokens_tolower() %>%
-  tokens_remove(stopwords("en")) %>%
-  tokens_wordstem() %>%
-  tokens_trim()
 
-unique_dfm <- dfm(unique_tokens)
-unique_tfidf <- dfm_weight(unique_dfm)
-
-# Convert to matrix format for modeling
-X <- as.matrix(unique_tfidf)
-y <- as.factor(tweet_labels$sexist)
-
-# Create training and validation sets (80/20 split)
-set.seed(123)
-trainIndex <- createDataPartition(y, p = 0.8, list = FALSE)
-X_train <- X[trainIndex,]
-X_test <- X[-trainIndex,]
-y_train <- y[trainIndex]
-y_test <- y[-trainIndex]
-
-# Create a more manageable feature set (top 500 features by variance)
-feat_variance <- apply(X_train, 2, var)
-top_features <- names(sort(feat_variance, decreasing = TRUE))[1:500]
-X_train_reduced <- X_train[, top_features]
-X_test_reduced <- X_test[, top_features]
-
-# IMPORTANT FIX: Extract emotion features from deduplicated tweets
-# First, we need to merge the emotion data with our deduplicated tweets
-# Create a mapping from tweet text to emotion features
-emotion_mapping <- train_data %>%
-  select(tweet, sentiment, anger, anticipation, disgust, fear, joy, 
-         sadness, surprise, trust, negative, positive, tweet_length) %>%
+# Create a dataset with all features
+tweet_labels_with_emotions <- train_data %>%
   group_by(tweet) %>%
-  summarize(across(c(sentiment, anger, anticipation, disgust, fear, joy, 
-                     sadness, surprise, trust, negative, positive, tweet_length), mean))
+  summarize(
+    sexist_ratio = mean(sexist == "yes"),
+    sexist = ifelse(sexist_ratio > 0.5, "yes", "no"),
+    tweet_length = first(tweet_length),
+    sentiment = first(sentiment),
+    anger = first(anger),
+    anticipation = first(anticipation),
+    disgust = first(disgust),
+    fear = first(fear),
+    joy = first(joy),
+    sadness = first(sadness),
+    surprise = first(surprise),
+    trust = first(trust),
+    negative = first(negative),
+    positive = first(positive)
+  ) %>%
+  filter(sexist_ratio != 0.5)
 
-# Now join this with our deduplicated tweet data
-tweet_labels_with_emotions <- tweet_labels %>%
-  left_join(emotion_mapping, by = "tweet")
+# Prepare features and target for SMOTE
+features <- c("tweet_length", "sentiment", "anger", "anticipation", 
+              "disgust", "fear", "joy", "sadness", "surprise", 
+              "trust", "negative", "positive")
 
-# Now extract the emotion features for training and test sets
-train_emotions <- as.matrix(tweet_labels_with_emotions[trainIndex, 
-                                                       c("sentiment", "anger", "anticipation", 
-                                                         "disgust", "fear", "joy", "sadness", 
-                                                         "surprise", "trust", "negative", "positive",
-                                                         "tweet_length")])
-test_emotions <- as.matrix(tweet_labels_with_emotions[-trainIndex, 
-                                                      c("sentiment", "anger", "anticipation", 
-                                                        "disgust", "fear", "joy", "sadness", 
-                                                        "surprise", "trust", "negative", "positive",
-                                                        "tweet_length")])
+smote_recipe <- recipe(sexist ~ ., data = smote_data) %>%
+  step_smote(sexist)
+smote_prep <- prep(smote_recipe)
+train_data_balanced <- bake(smote_prep, new_data = NULL)
 
-# Now the dimensions should match and this should work without error
-X_train_full <- cbind(X_train_reduced, train_emotions)
-X_test_full <- cbind(X_test_reduced, test_emotions)
+balanced_distribution <- train_data_balanced %>%  # Use train_data_balanced instead of smote_data_balanced
+  count(sexist) %>%
+  mutate(prop = n / sum(n))
 
-# Verify the dimensions match
-cat("X_train_reduced dimensions:", dim(X_train_reduced), "\n")
-cat("train_emotions dimensions:", dim(train_emotions), "\n")
-cat("X_test_reduced dimensions:", dim(X_test_reduced), "\n")
-cat("test_emotions dimensions:", dim(test_emotions), "\n")
+print("Balanced Class Distribution after SMOTE:")
+print(balanced_distribution)
+
+# Visualize the distribution
+ggplot(balanced_distribution, aes(x = sexist, fill = sexist)) +
+  geom_bar() +
+  labs(title = "Class Distribution after SMOTE", 
+       x = "Sexist Label", 
+       y = "Count") +
+  theme_minimal()
+
+# Separa features (X) e target (y) de TREINO
+X_train_final <- train_data_balanced %>% select(-sexist)
+y_train_final <- train_data_balanced$sexist
+
+# DEV (sem SMOTE)
+X_dev <- dev_data %>% 
+  select(all_of(features)) %>%
+  mutate(across(everything(), ~ ifelse(is.na(.), 0, .)))
+y_dev <- as.factor(dev_data$sexist)
+
+
+X_train_df <- as.data.frame(X_train_final)
+y_train_final <- factor(y_train_final, levels = c("no", "yes"))  # Ensure consistent factor levels
+
+X_dev_df <- as.data.frame(X_dev)
+y_dev <- factor(y_dev, levels = c("no", "yes"))  # Ensure consistent factor levels
+
+
+X_train_scaled <- scale(X_train_df)
+X_dev_scaled <- scale(X_dev_df, 
+                      center = attr(X_train_scaled, "scaled:center"), 
+                      scale = attr(X_train_scaled, "scaled:scale"))
+
+X_train_scaled_df <- as.data.frame(X_train_scaled)
+X_dev_scaled_df <- as.data.frame(X_dev_scaled)
+X_train_numeric <- data.frame(lapply(X_train_scaled_df, as.numeric))
+X_dev_numeric <- data.frame(lapply(X_dev_scaled_df, as.numeric))
+
+train_df_formula <- cbind(X_train_scaled_df, sexist = y_train_final)
+
 
 # MODEL 1: Logistic Regression
 cat("\nTraining Logistic Regression model...\n")
-model_lr <- glm(y_train ~ ., data = as.data.frame(X_train_full), family = "binomial")
-pred_lr <- predict(model_lr, as.data.frame(X_test_full), type = "response")
-pred_class_lr <- ifelse(pred_lr > 0.5, "yes", "no")
-conf_mat_lr <- confusionMatrix(as.factor(pred_class_lr), y_test)
-roc_lr <- roc(as.numeric(y_test == "yes"), pred_lr)
+model_lr <- cv.glmnet(as.matrix(X_train_scaled), y_train_final, 
+                      family = "binomial", alpha = 0)  # Ridge regression
+pred_lr <- predict(model_lr, newx = as.matrix(X_dev_scaled), s = "lambda.min", type = "response")
+pred_class_lr <- ifelse(pred_lr > 0.5, "yes", "no") %>% factor(levels = levels(y_dev))
+conf_mat_lr <- confusionMatrix(pred_class_lr, y_dev)
+roc_lr <- roc(as.numeric(y_dev == "yes"), pred_lr)
 auc_lr <- auc(roc_lr)
 
 print("Logistic Regression Results:")
@@ -238,12 +259,14 @@ cat("AUC:", auc_lr, "\n")
 
 # MODEL 2: Support Vector Machine
 cat("\nTraining SVM model...\n")
-model_svm <- svm(y_train ~ ., data = as.data.frame(X_train_full), probability = TRUE)
-pred_svm <- predict(model_svm, as.data.frame(X_test_full), probability = TRUE)
+model_svm <- svm(sexist  ~ ., 
+                 data = X_train_scaled_df, 
+                 probability = TRUE)
+pred_svm <- predict(model_svm, newdata = as.data.frame(X_dev_scaled), probability = TRUE)
 pred_prob_svm <- attr(pred_svm, "probabilities")[,"yes"]
-pred_class_svm <- ifelse(pred_prob_svm > 0.5, "yes", "no")
-conf_mat_svm <- confusionMatrix(as.factor(pred_class_svm), y_test)
-roc_svm <- roc(as.numeric(y_test == "yes"), pred_prob_svm)
+pred_class_svm <- ifelse(pred_prob_svm > 0.5, "yes", "no") %>% factor(levels = levels(y_dev))
+conf_mat_svm <- confusionMatrix(pred_class_svm, y_dev)
+roc_svm <- roc(as.numeric(y_dev == "yes"), pred_prob_svm)
 auc_svm <- auc(roc_svm)
 
 print("SVM Results:")
@@ -252,11 +275,13 @@ cat("AUC:", auc_svm, "\n")
 
 # MODEL 3: Decision Tree
 cat("\nTraining Decision Tree model...\n")
-model_dt <- rpart(y_train ~ ., data = as.data.frame(X_train_full))
-pred_dt <- predict(model_dt, as.data.frame(X_test_full), type = "prob")[,"yes"]
-pred_class_dt <- ifelse(pred_dt > 0.5, "yes", "no")
-conf_mat_dt <- confusionMatrix(as.factor(pred_class_dt), y_test)
-roc_dt <- roc(as.numeric(y_test == "yes"), pred_dt)
+model_dt <- rpart(sexist ~ ., 
+                  data = train_df_formula,
+                  method = "class")
+pred_dt <- predict(model_dt, X_dev_scaled_df, type = "prob")[,"yes"]
+pred_class_dt <- ifelse(pred_dt > 0.5, "yes", "no") %>% factor(levels = levels(y_dev))
+conf_mat_dt <- confusionMatrix(pred_class_dt, y_dev)
+roc_dt <- roc(as.numeric(y_dev == "yes"), pred_dt)
 auc_dt <- auc(roc_dt)
 
 print("Decision Tree Results:")
@@ -264,169 +289,105 @@ print(conf_mat_dt)
 cat("AUC:", auc_dt, "\n")
 
 # MODEL 4: XGBOOST
+cat("\nTraining XGBoost model...\n")
 
-y_train_num <- ifelse(y_train == "yes", 1, 0)
-y_test_num <- ifelse(y_test == "yes", 1, 0)
+dtrain <- xgb.DMatrix(data = as.matrix(X_train_numeric), 
+                      label = as.numeric(y_train_final == "yes"))
+ddev <- xgb.DMatrix(data = as.matrix(X_dev_numeric), 
+                    label = as.numeric(y_dev == "yes"))
 
-X_train_xgb <- as.matrix(X_train_full)
-X_test_xgb <- as.matrix(X_test_full)
-
-# Create DMatrix objects for XGBoost
-dtrain <- xgb.DMatrix(data = X_train_xgb, label = y_train_num)
-dtest <- xgb.DMatrix(data = X_test_xgb, label = y_test_num)
-
-
-cat("\nStarting hyperparameter optimisation with cross-validation...\n")
-
-# List of parameters to test in cross-validation
-param_grid <- list(
-  max_depth = c(3, 5, 7),
-  eta = c(0.01, 0.05, 0.1),
-  gamma = c(0, 0.1, 0.3),
-  subsample = c(0.7, 0.8, 0.9),
-  colsample_bytree = c(0.7, 0.8, 0.9),
-  min_child_weight = c(1, 3, 5)
-)
-
-# Function to evaluate a specific combination of parameters
-evaluate_params <- function(max_depth, eta, gamma, subsample, colsample_bytree, min_child_weight) {
-  params <- list(
-    objective = "binary:logistic",
-    eval_metric = "auc",
-    max_depth = max_depth,
-    eta = eta,
-    gamma = gamma,
-    subsample = subsample,
-    colsample_bytree = colsample_bytree,
-    min_child_weight = min_child_weight
-  )
-  
-  cv_results <- xgb.cv(
-    params = params,
-    data = dtrain,
-    nrounds = 100,
-    nfold = 5,
-    early_stopping_rounds = 10,
-    verbose = 0
-  )
-  
-  # Return best AUC
-  best_auc <- max(cv_results$evaluation_log$test_auc_mean)
-  return(list(auc = best_auc, nrounds = which.max(cv_results$evaluation_log$test_auc_mean)))
-}
-
-# Initialise results
-results <- data.frame()
-
-# Limiting the number of combinations to save time
-# Randomly selecting some combinations
-set.seed(42)
-max_depth_vals <- sample(param_grid$max_depth, 2)
-eta_vals <- sample(param_grid$eta, 2)
-gamma_vals <- sample(param_grid$gamma, 2)
-subsample_vals <- sample(param_grid$subsample, 2)
-colsample_vals <- sample(param_grid$colsample_bytree, 2)
-min_child_vals <- sample(param_grid$min_child_weight, 2)
-
-# Reduced search grid
-for (depth in max_depth_vals) {
-  for (eta_val in eta_vals) {
-    for (gamma_val in gamma_vals) {
-      for (subsample_val in subsample_vals) {
-        for (colsample_val in colsample_vals) {
-          for (min_child_val in min_child_vals) {
-            cat("Evaluating: depth =", depth, "eta =", eta_val, "gamma =", gamma_val, "\n")
-            
-            result <- evaluate_params(depth, eta_val, gamma_val, subsample_val, colsample_val, min_child_val)
-            
-            results <- rbind(results, data.frame(
-              max_depth = depth,
-              eta = eta_val,
-              gamma = gamma_val,
-              subsample = subsample_val,
-              colsample_bytree = colsample_val,
-              min_child_weight = min_child_val,
-              auc = result$auc,
-              nrounds = result$nrounds
-            ))
-          }
-        }
-      }
-    }
-  }
-}
-
-# Find the best parameters
-best_params_idx <- which.max(results$auc)
-best_params <- results[best_params_idx, ]
-cat("\nBest parameters found:\n")
-print(best_params)
-
-# Train the final model with the best parameters
 final_params <- list(
   objective = "binary:logistic",
   eval_metric = "auc",
-  max_depth = best_params$max_depth,
-  eta = best_params$eta,
-  gamma = best_params$gamma,
-  subsample = best_params$subsample,
-  colsample_bytree = best_params$colsample_bytree,
-  min_child_weight = best_params$min_child_weight
+  max_depth = 6,
+  eta = 0.1,
+  gamma = 0,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  min_child_weight = 1
 )
 
-# Train the final model
-xgb_final <- xgb.train(
+best_params <- list(nrounds = 100)
+
+# Train
+xgb_model <- xgb.train(
   params = final_params,
   data = dtrain,
   nrounds = best_params$nrounds,
   verbose = 0
 )
 
-cat("\nEvaluating XGBoost...\n")
-pred_xgb <- predict(xgb_final, dtest)
-pred_class_xgb <- ifelse(pred_xgb > 0.5, "yes", "no")
-conf_mat_xgb <- confusionMatrix(as.factor(pred_class_xgb), y_test)
-roc_xgb <- roc(as.numeric(y_test == "yes"), pred_xgb)
+# Now prediction should work
+pred_xgb <- predict(xgb_model, ddev)
+pred_class_xgb <- ifelse(pred_xgb > 0.5, "yes", "no") %>% factor(levels = levels(y_dev))
+conf_mat_xgb <- confusionMatrix(pred_class_xgb, y_dev)
+roc_xgb <- roc(as.numeric(y_dev == "yes"), pred_xgb)
 auc_xgb <- auc(roc_xgb)
 
-# Display results
-cat("\nXGBoost Results:\n")
+print("XGBoost Results:")
 print(conf_mat_xgb)
 cat("AUC:", auc_xgb, "\n")
 
+# MODEL 5: RANDOM FOREST
+train_data_rf <- cbind(X_train_numeric, sexist = y_train_final)
 
-# Compare model performance including XGBoost
+# Train Random Forest model
+model_rf <- randomForest(
+  sexist ~ ., 
+  data = train_data_rf,
+  ntree = 500,
+  mtry = sqrt(ncol(X_train_numeric)),
+  importance = TRUE
+)
+
+# Make predictions
+pred_rf <- predict(model_rf, X_dev_numeric, type = "prob")[,"yes"]
+pred_class_rf <- ifelse(pred_rf > 0.5, "yes", "no") %>% factor(levels = levels(y_dev))
+conf_mat_rf <- confusionMatrix(pred_class_rf, y_dev)
+roc_rf <- roc(as.numeric(y_dev == "yes"), pred_rf)
+auc_rf <- auc(roc_rf)
+
+print("Random Forest Results:")
+print(conf_mat_rf)
+cat("AUC:", auc_rf, "\n")
+
+# Model Comparison
 model_comparison <- data.frame(
-  Model = c("Logistic Regression", "SVM", "Decision Tree", "XGBoost"),
+  Model = c("Logistic Regression", "SVM", "Decision Tree", "XGBoost", "Random Forest"),
   Accuracy = c(conf_mat_lr$overall["Accuracy"], 
                conf_mat_svm$overall["Accuracy"], 
                conf_mat_dt$overall["Accuracy"],
-               conf_mat_xgb$overall["Accuracy"]),
+               conf_mat_xgb$overall["Accuracy"],
+               conf_mat_rf$overall["Accuracy"]),
   Precision = c(conf_mat_lr$byClass["Pos Pred Value"], 
                 conf_mat_svm$byClass["Pos Pred Value"], 
                 conf_mat_dt$byClass["Pos Pred Value"],
-                conf_mat_xgb$byClass["Pos Pred Value"]),
+                conf_mat_xgb$byClass["Pos Pred Value"],
+                conf_mat_rf$byClass["Pos Pred Value"]),
   Recall = c(conf_mat_lr$byClass["Sensitivity"], 
              conf_mat_svm$byClass["Sensitivity"], 
              conf_mat_dt$byClass["Sensitivity"],
-             conf_mat_xgb$byClass["Sensitivity"]),
+             conf_mat_xgb$byClass["Sensitivity"],
+             conf_mat_rf$byClass["Sensitivity"]),
   F1_Score = c(conf_mat_lr$byClass["F1"], 
                conf_mat_svm$byClass["F1"], 
                conf_mat_dt$byClass["F1"],
-               conf_mat_xgb$byClass["F1"]),
-  AUC = c(auc_lr, auc_svm, auc_dt, auc_xgb)
+               conf_mat_xgb$byClass["F1"],
+               conf_mat_rf$byClass["F1"]),
+  AUC = c(auc_lr, auc_svm, auc_dt, auc_xgb, auc_rf)
 )
 
-
-print("Model Performance Comparison:")
+print("Final Model Comparison:")
 print(model_comparison)
 
-# Plot ROC curves for all models
-png("roc_curves.png", width=800, height=600)
-plot(roc_lr, col = "blue", main = "ROC Curve Comparison")
+# ROC Curve Plot
+png("final_roc_curves.png", width=800, height=600)
+plot(roc_lr, col = "blue", main = "ROC Curves Comparison")
 plot(roc_svm, col = "red", add = TRUE)
 plot(roc_dt, col = "green", add = TRUE)
-legend("bottomright", legend = c("Logistic Regression", "SVM", "Decision Tree"),
-       col = c("blue", "red", "green"), lwd = 2)
+plot(roc_xgb, col = "purple", add = TRUE)
+plot(roc_rf, col = "orange", add = TRUE)
+legend("bottomright", 
+       legend = c("Logistic Regression", "SVM", "Decision Tree", "XGBoost", "Random Forest"),
+       col = c("blue", "red", "green", "purple", "orange"), lwd = 2)
 dev.off()
-
