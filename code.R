@@ -36,7 +36,10 @@ library(scales)
 library(viridis)      
 library(tidytext)     
 library(ggwordcloud) 
-library(pdp)         
+library(pdp)   
+library(parallel)
+library(doParallel)
+library(rpart.plot)
 
 theme_set(theme_minimal(base_size = 12) + 
             theme(
@@ -733,215 +736,461 @@ ggplot(balanced_distribution, aes(x = sexist, fill = sexist)) +
 X_train_final <- train_data_balanced %>% select(-sexist)
 y_train_final <- train_data_balanced$sexist
 
-# Prepare features and target for dev
+# Prepare features and target for dev set
 X_dev <- dev_modeling %>% 
   select(all_of(features)) %>%
-  mutate(across(everything(), ~ ifelse(is.na(.), 0, .)))
+  mutate(across(everything(), ~ ifelse(is.na(.), 0, .))) # Replace NA values with 0
 y_dev <- as.factor(dev_modeling$sexist)
 
-# Convert to dataframes
+# Convert to data frames
 X_train_df <- as.data.frame(X_train_final)
-y_train_final <- factor(y_train_final, levels = c("no", "yes"))  # Ensure consistent factor levels
+# Ensure consistent factor levels across all datasets
+y_train_final <- factor(y_train_final, levels = c("no", "yes"))  
 
 X_dev_df <- as.data.frame(X_dev)
-y_dev <- factor(y_dev, levels = c("no", "yes"))  # Ensure consistent factor levels
+y_dev <- factor(y_dev, levels = c("no", "yes"))
 
-# Scale features
+# Scale features - using training set parameters for dev set to prevent data leakage
 X_train_scaled <- scale(X_train_df)
 X_dev_scaled <- scale(X_dev_df, 
                       center = attr(X_train_scaled, "scaled:center"), 
                       scale = attr(X_train_scaled, "scaled:scale"))
 
+# Convert to dataframes for model training
 X_train_scaled_df <- as.data.frame(X_train_scaled)
 X_dev_scaled_df <- as.data.frame(X_dev_scaled)
-X_train_numeric <- data.frame(lapply(X_train_scaled_df, as.numeric))
-X_dev_numeric <- data.frame(lapply(X_dev_scaled_df, as.numeric))
 
-train_df_formula <- cbind(X_train_scaled_df, sexist = y_train_final)
+# Combine predictors and response for training
+train_data_combined <- cbind(X_train_scaled_df, sexist = y_train_final)
+
+# Set up for parallel processing to speed up cross-validation
+num_cores <- detectCores() - 1  # Leave one core free
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
 
 # -------------------------------------------------------------------------------------------------------------------
 # Model Training and Evaluation
 # -------------------------------------------------------------------------------------------------------------------
 
-# MODEL 1: Logistic Regression
-cat("\nTraining Logistic Regression model...\n")
-model_lr <- cv.glmnet(as.matrix(X_train_scaled), y_train_final, 
-                      family = "binomial", alpha = 0)  # Ridge regression
-pred_lr <- predict(model_lr, newx = as.matrix(X_dev_scaled), s = "lambda.min", type = "response")
-pred_class_lr <- ifelse(pred_lr > 0.5, "yes", "no") %>% factor(levels = levels(y_dev))
-conf_mat_lr <- confusionMatrix(pred_class_lr, y_dev)
-roc_lr <- roc(as.numeric(y_dev == "yes"), as.numeric(pred_lr))
-auc_lr <- auc(roc_lr)
+# Cross-Validation Setup
 
-print("Logistic Regression Results:")
-print(conf_mat_lr)
-cat("AUC:", auc_lr, "\n")
 
-# MODEL 2: Support Vector Machine
-cat("\nTraining SVM model...\n")
-model_svm <- svm(sexist ~ ., 
-                 data = train_df_formula, 
-                 probability = TRUE)
-pred_svm <- predict(model_svm, newdata = X_dev_scaled_df, probability = TRUE)
-pred_prob_svm <- attr(pred_svm, "probabilities")[,"yes"]
-pred_class_svm <- ifelse(pred_prob_svm > 0.5, "yes", "no") %>% factor(levels = levels(y_dev))
-conf_mat_svm <- confusionMatrix(pred_class_svm, y_dev)
-roc_svm <- roc(as.numeric(y_dev == "yes"), pred_prob_svm)
-auc_svm <- auc(roc_svm)
-
-print("SVM Results:")
-print(conf_mat_svm)
-cat("AUC:", auc_svm, "\n")
-
-# MODEL 3: Decision Tree
-cat("\nTraining Decision Tree model...\n")
-model_dt <- rpart(sexist ~ ., 
-                  data = train_df_formula,
-                  method = "class")
-pred_dt <- predict(model_dt, X_dev_scaled_df, type = "prob")[,"yes"]
-pred_class_dt <- ifelse(pred_dt > 0.5, "yes", "no") %>% factor(levels = levels(y_dev))
-conf_mat_dt <- confusionMatrix(pred_class_dt, y_dev)
-roc_dt <- roc(as.numeric(y_dev == "yes"), pred_dt)
-auc_dt <- auc(roc_dt)
-
-print("Decision Tree Results:")
-print(conf_mat_dt)
-cat("AUC:", auc_dt, "\n")
-
-# MODEL 4: XGBoost
-cat("\nTraining XGBoost model...\n")
-
-dtrain <- xgb.DMatrix(data = as.matrix(X_train_numeric), 
-                      label = as.numeric(y_train_final == "yes"))
-ddev <- xgb.DMatrix(data = as.matrix(X_dev_numeric), 
-                    label = as.numeric(y_dev == "yes"))
-
-final_params <- list(
-  objective = "binary:logistic",
-  eval_metric = "auc",
-  max_depth = 6,
-  eta = 0.1,
-  gamma = 0,
-  subsample = 0.8,
-  colsample_bytree = 0.8,
-  min_child_weight = 1
+# Define cross-validation control
+cv_control <- trainControl(
+  method = "cv",
+  number = 5,  # 5-fold cross-validation
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,  # For binary classification metrics
+  savePredictions = "final",
+  verboseIter = TRUE,
+  allowParallel = TRUE
 )
 
-best_params <- list(nrounds = 100)
+# Create list to store all ROC objects and prediction results
+roc_list <- list()
+prediction_list <- list()
+cv_results_list <- list()
 
-# Train XGBoost
-xgb_model <- xgb.train(
-  params = final_params,
-  data = dtrain,
-  nrounds = best_params$nrounds,
-  verbose = 0
+# Function to evaluate model performance on the dev set
+evaluate_model <- function(model, X_dev, y_dev, model_name, prob_method = "prob") {
+  if (prob_method == "prob") {
+    # For models that use predict(..., type="prob")
+    pred_probs <- predict(model, X_dev, type = "prob")
+    pred_prob <- pred_probs[, "yes"]
+  } else if (prob_method == "response") {
+    # For models like glmnet that use predict(..., type="response")
+    pred_prob <- predict(model, X_dev, type = "response")
+  } else if (prob_method == "xgb") {
+    # For XGBoost
+    X_dev_matrix <- as.matrix(X_dev)
+    pred_prob <- predict(model, newdata = X_dev_matrix)
+  }
+  
+  # Calculate binary predictions using 0.5 threshold
+  pred_class <- ifelse(pred_prob > 0.5, "yes", "no") %>% factor(levels = c("no", "yes"))
+  
+  # Calculate performance metrics
+  conf_mat <- confusionMatrix(pred_class, y_dev)
+  roc_obj <- roc(as.numeric(y_dev == "yes"), pred_prob)
+  auc_val <- auc(roc_obj)
+  
+  # Store results
+  roc_list[[model_name]] <<- roc_obj
+  prediction_list[[model_name]] <<- list(
+    pred_prob = pred_prob,
+    pred_class = pred_class,
+    conf_mat = conf_mat,
+    auc = auc_val
+  )
+  
+  # Print results
+  cat("\n", model_name, "Results:\n")
+  print(conf_mat)
+  cat("AUC:", auc_val, "\n")
+  
+  return(list(conf_mat = conf_mat, auc = auc_val))
+}
+
+# -----------------------------------------------------------------------------
+# MODEL 1: Logistic Regression with CV Tuning
+# -----------------------------------------------------------------------------
+cat("\nTraining Logistic Regression model with cross-validation...\n")
+
+# Set up grid for alpha (elastic net mixing parameter) and lambda (regularization strength)
+glmnet_grid <- expand.grid(
+  alpha = c(0, 0.2, 0.5, 0.8, 1),  # 0 = ridge, 1 = lasso, between = elastic net
+  lambda = 10^seq(-4, 0, length.out = 10)
 )
 
-# Make predictions
-pred_xgb <- predict(xgb_model, ddev)
-pred_class_xgb <- ifelse(pred_xgb > 0.5, "yes", "no") %>% factor(levels = levels(y_dev))
-conf_mat_xgb <- confusionMatrix(pred_class_xgb, y_dev)
-roc_xgb <- roc(as.numeric(y_dev == "yes"), pred_xgb)
-auc_xgb <- auc(roc_xgb)
-
-print("XGBoost Results:")
-print(conf_mat_xgb)
-cat("AUC:", auc_xgb, "\n")
-
-# MODEL 5: Random Forest
-cat("\nTraining Random Forest model...\n")
-train_data_rf <- cbind(X_train_numeric, sexist = y_train_final)
-
-# Train Random Forest model
-model_rf <- randomForest(
-  sexist ~ ., 
-  data = train_data_rf,
-  ntree = 500,
-  mtry = sqrt(ncol(X_train_numeric)),
-  importance = TRUE
+# Train model with caret for cross-validation
+lr_cv_model <- train(
+  x = as.matrix(X_train_scaled_df),
+  y = y_train_final,
+  method = "glmnet",
+  trControl = cv_control,
+  tuneGrid = glmnet_grid,
+  metric = "ROC"
 )
 
-# Make predictions
-pred_rf <- predict(model_rf, X_dev_numeric, type = "prob")[,"yes"]
-pred_class_rf <- ifelse(pred_rf > 0.5, "yes", "no") %>% factor(levels = levels(y_dev))
-conf_mat_rf <- confusionMatrix(pred_class_rf, y_dev)
-roc_rf <- roc(as.numeric(y_dev == "yes"), pred_rf)
-auc_rf <- auc(roc_rf)
+# Extract best model parameters
+lr_best_alpha <- lr_cv_model$bestTune$alpha
+lr_best_lambda <- lr_cv_model$bestTune$lambda
 
-print("Random Forest Results:")
-print(conf_mat_rf)
-cat("AUC:", auc_rf, "\n")
+cat("\nLogistic Regression Best Parameters:\n")
+cat("Alpha:", lr_best_alpha, "\n")
+cat("Lambda:", lr_best_lambda, "\n")
+
+# Evaluate on dev set
+lr_results <- evaluate_model(
+  lr_cv_model, 
+  X_dev_scaled_df, 
+  y_dev, 
+  "Logistic Regression", 
+  prob_method = "prob"
+)
+
+# Store cross-validation results
+cv_results_list[["Logistic Regression"]] <- lr_cv_model$results
+
+# -----------------------------------------------------------------------------
+# MODEL 2: Support Vector Machine with CV Tuning
+# -----------------------------------------------------------------------------
+cat("\nTraining SVM model with cross-validation...\n")
+
+# Set up grid for SVM parameters
+svm_grid <- expand.grid(
+  sigma = 2^seq(-8, 1, length.out = 5),
+  C = 2^seq(-2, 7, length.out = 5)
+)
+
+# Train model with caret for cross-validation
+svm_cv_model <- train(
+  x = X_train_scaled_df,
+  y = y_train_final,
+  method = "svmRadial",
+  trControl = cv_control,
+  tuneGrid = svm_grid,
+  metric = "ROC",
+  preProcess = NULL  # Already scaled
+)
+
+# Extract best model parameters
+svm_best_sigma <- svm_cv_model$bestTune$sigma
+svm_best_C <- svm_cv_model$bestTune$C
+
+cat("\nSVM Best Parameters:\n")
+cat("Sigma:", svm_best_sigma, "\n")
+cat("C:", svm_best_C, "\n")
+
+# Evaluate on dev set
+svm_results <- evaluate_model(
+  svm_cv_model, 
+  X_dev_scaled_df, 
+  y_dev, 
+  "SVM", 
+  prob_method = "prob"
+)
+
+# Store cross-validation results
+cv_results_list[["SVM"]] <- svm_cv_model$results
+
+# -----------------------------------------------------------------------------
+# MODEL 3: Decision Tree with CV Tuning
+# -----------------------------------------------------------------------------
+cat("\nTraining Decision Tree model with cross-validation...\n")
+
+# Set up grid for decision tree parameters
+rpart_grid <- expand.grid(
+  cp = seq(0.001, 0.05, by = 0.005)  # complexity parameter
+)
+
+# Train model with caret for cross-validation
+dt_cv_model <- train(
+  x = X_train_scaled_df,
+  y = y_train_final,
+  method = "rpart",
+  trControl = cv_control,
+  tuneGrid = rpart_grid,
+  metric = "ROC"
+)
+
+# Extract best model parameters
+dt_best_cp <- dt_cv_model$bestTune$cp
+
+cat("\nDecision Tree Best Parameters:\n")
+cat("Complexity Parameter:", dt_best_cp, "\n")
+
+# Evaluate on dev set
+dt_results <- evaluate_model(
+  dt_cv_model, 
+  X_dev_scaled_df, 
+  y_dev, 
+  "Decision Tree", 
+  prob_method = "prob"
+)
+
+# Store cross-validation results
+cv_results_list[["Decision Tree"]] <- dt_cv_model$results
+
+# Plot the decision tree
+best_tree <- dt_cv_model$finalModel
+rpart.plot(best_tree, box.palette = "RdBu", shadow.col = "gray", nn = TRUE)
+
+
+# -----------------------------------------------------------------------------
+# MODEL 4: Random Forest with CV Tuning
+# -----------------------------------------------------------------------------
+cat("\nTraining Random Forest model with cross-validation...\n")
+
+# Set up grid for random forest parameters
+rf_grid <- expand.grid(
+  mtry = seq(2, min(20, ncol(X_train_scaled_df)), by = 3)
+)
+
+# Train model with caret for cross-validation
+rf_cv_model <- train(
+  x = X_train_scaled_df,
+  y = y_train_final,
+  method = "rf",
+  trControl = cv_control,
+  tuneGrid = rf_grid,
+  metric = "ROC",
+  importance = TRUE,
+  ntree = 300
+)
+
+# Extract best model parameters
+rf_best_mtry <- rf_cv_model$bestTune$mtry
+
+cat("\nRandom Forest Best Parameters:\n")
+cat("mtry:", rf_best_mtry, "\n")
+
+# Evaluate on dev set
+rf_results <- evaluate_model(
+  rf_cv_model, 
+  X_dev_scaled_df, 
+  y_dev, 
+  "Random Forest", 
+  prob_method = "prob"
+)
+
+# Store cross-validation results
+cv_results_list[["Random Forest"]] <- rf_cv_model$results
+
+# -----------------------------------------------------------------------------
+# MODEL 5: XGBoost with CV Tuning
+# -----------------------------------------------------------------------------
+cat("\nTraining XGBoost model with cross-validation...\n")
+
+# Set up xgb parameters grid
+xgb_grid <- expand.grid(
+  nrounds = c(50, 100, 150),
+  eta = c(0.01, 0.05, 0.1),
+  max_depth = c(3, 6, 9),
+  gamma = c(0, 0.1, 0.5),
+  colsample_bytree = c(0.6, 0.8, 1.0),
+  min_child_weight = c(1, 3, 5),
+  subsample = c(0.6, 0.8, 1.0)
+)
+
+# For simplicity in this example, we'll use a smaller grid
+xgb_grid_small <- expand.grid(
+  nrounds = c(100),
+  eta = c(0.1),
+  max_depth = c(6),
+  gamma = c(0),
+  colsample_bytree = c(0.8),
+  min_child_weight = c(1),
+  subsample = c(0.8)
+)
+
+# Create proper train/test matrices for XGBoost
+X_train_matrix <- as.matrix(X_train_scaled_df)
+X_dev_matrix <- as.matrix(X_dev_scaled_df)
+
+# Train XGBoost model with cv
+xgb_cv_model <- train(
+  x = X_train_matrix,
+  y = y_train_final,
+  method = "xgbTree",
+  trControl = cv_control,
+  tuneGrid = xgb_grid_small,
+  metric = "ROC",
+  verbose = FALSE
+)
+
+# Extrair os melhores parâmetros do modelo
+xgb_best_params <- xgb_cv_model$bestTune
+
+cat("\nXGBoost Best Parameters:\n")
+print(xgb_best_params)
+
+# Predições no conjunto de validação (dev set)
+probs_xgb <- predict(xgb_cv_model, newdata = X_dev_matrix, type = "prob")[, 2]
+preds_xgb <- ifelse(probs_xgb > 0.5, levels(y_dev)[2], levels(y_dev)[1])
+preds_xgb <- factor(preds_xgb, levels = levels(y_dev))
+
+# Matriz de confusão
+conf_mat_xgb <- caret::confusionMatrix(preds_xgb, y_dev, positive = levels(y_dev)[2])
+
+# Calculando a curva ROC e o AUC utilizando o pacote pROC
+roc_xgb <- pROC::roc(response = y_dev, predictor = probs_xgb)
+auc_xgb <- pROC::auc(roc_xgb)
+
+# Exibir o AUC no console
+cat("\nXGBoost AUC:\n")
+print(auc_xgb)
+
+# Armazenar os resultados de cross-validation
+cv_results_list[["XGBoost"]] <- xgb_cv_model$results
+
+# -----------------------------------------------------------------------------
+# MODEL 6: Gradient Boosting Machine with CV Tuning
+# -----------------------------------------------------------------------------
+cat("\nTraining GBM model with cross-validation...\n")
+
+# Set up grid for GBM parameters
+gbm_grid <- expand.grid(
+  n.trees = c(100, 200),
+  interaction.depth = c(3, 5),
+  shrinkage = c(0.01, 0.1),
+  n.minobsinnode = c(10)
+)
+
+# Train model with caret for cross-validation
+gbm_cv_model <- train(
+  x = X_train_scaled_df,
+  y = y_train_final,
+  method = "gbm",
+  trControl = cv_control,
+  tuneGrid = gbm_grid,
+  metric = "ROC",
+  verbose = FALSE
+)
+
+# Extract best model parameters
+gbm_best_params <- gbm_cv_model$bestTune
+
+cat("\nGBM Best Parameters:\n")
+print(gbm_best_params)
+
+# Predictions on dev set
+probs_gbm <- predict(gbm_cv_model, newdata = X_dev_scaled_df, type = "prob")[, 2]
+preds_gbm <- ifelse(probs_gbm > 0.5, levels(y_dev)[2], levels(y_dev)[1])
+preds_gbm <- factor(preds_gbm, levels = levels(y_dev))
+
+# Confusion matrix
+conf_mat_gbm <- caret::confusionMatrix(preds_gbm, y_dev, positive = levels(y_dev)[2])
+
+# ROC and AUC
+roc_gbm <- pROC::roc(response = y_dev, predictor = probs_gbm)
+auc_gbm <- pROC::auc(roc_gbm)
+
+# Output AUC to console
+cat("\nGBM AUC:\n")
+print(auc_gbm)
+
+# Store cross-validation results
+cv_results_list[["GBM"]] <- gbm_cv_model$results
 
 
 # Model Comparison
 
+# Create comprehensive model comparison dataframe
 model_comparison <- data.frame(
-  Model = c("Logistic Regression", "SVM", "Decision Tree", "XGBoost", "Random Forest"),
+  Model = c("Logistic Regression", "SVM", "Decision Tree", "Random Forest", 
+            "XGBoost", "GBM"),
   Accuracy = c(conf_mat_lr$overall["Accuracy"], 
                conf_mat_svm$overall["Accuracy"], 
                conf_mat_dt$overall["Accuracy"],
+               conf_mat_rf$overall["Accuracy"],
                conf_mat_xgb$overall["Accuracy"],
-               conf_mat_rf$overall["Accuracy"]),
+               conf_mat_gbm$overall["Accuracy"]),
   Precision = c(conf_mat_lr$byClass["Pos Pred Value"], 
                 conf_mat_svm$byClass["Pos Pred Value"], 
                 conf_mat_dt$byClass["Pos Pred Value"],
+                conf_mat_rf$byClass["Pos Pred Value"],
                 conf_mat_xgb$byClass["Pos Pred Value"],
-                conf_mat_rf$byClass["Pos Pred Value"]),
+                conf_mat_gbm$byClass["Pos Pred Value"]),
   Recall = c(conf_mat_lr$byClass["Sensitivity"], 
              conf_mat_svm$byClass["Sensitivity"], 
              conf_mat_dt$byClass["Sensitivity"],
+             conf_mat_rf$byClass["Sensitivity"],
              conf_mat_xgb$byClass["Sensitivity"],
-             conf_mat_rf$byClass["Sensitivity"]),
+             conf_mat_gbm$byClass["Sensitivity"]),
   F1_Score = c(conf_mat_lr$byClass["F1"], 
                conf_mat_svm$byClass["F1"], 
                conf_mat_dt$byClass["F1"],
+               conf_mat_rf$byClass["F1"],
                conf_mat_xgb$byClass["F1"],
-               conf_mat_rf$byClass["F1"]),
-  AUC = c(auc_lr, auc_svm, auc_dt, auc_xgb, auc_rf)
+               conf_mat_gbm$byClass["F1"]),
+  AUC = c(auc_lr, auc_svm, auc_dt, auc_rf, auc_xgb, auc_gbm)
 )
 
 print("Final Model Comparison:")
 print(model_comparison)
 
-# ROC Curve Plot
-png("final_roc_curves.png", width=800, height=600)
-plot(roc_lr, col = "blue", main = "ROC Curves Comparison")
-plot(roc_svm, col = "red", add = TRUE)
-plot(roc_dt, col = "green", add = TRUE)
-plot(roc_xgb, col = "purple", add = TRUE)
-plot(roc_rf, col = "orange", add = TRUE)
+# VISUALIZATIONS
+
+# ROC Curve Plot for all models
+
+plot(roc_lr, col = "blue", main = "ROC Curves Comparison", lwd = 2)
+plot(roc_svm, col = "red", add = TRUE, lwd = 2)
+plot(roc_dt, col = "green", add = TRUE, lwd = 2)
+plot(roc_rf, col = "orange", add = TRUE, lwd = 2)
+plot(roc_xgb, col = "purple", add = TRUE, lwd = 2)
+plot(roc_gbm, col = "brown", add = TRUE, lwd = 2)
 legend("bottomright", 
-       legend = c("Logistic Regression", "SVM", "Decision Tree", "XGBoost", "Random Forest"),
-       col = c("blue", "red", "green", "purple", "orange"), lwd = 2)
-dev.off()
+       legend = c("Logistic Regression", "SVM", "Decision Tree", "Random Forest", 
+                  "XGBoost", "GBM"),
+       col = c("blue", "red", "green", "orange", "purple", "brown", "pink", "darkgray"), 
+       lwd = 2)
 
 
-# Feature Importance Analysis
+# Model Comparison Bar Chart
+model_comparison_long <- model_comparison %>%
+  pivot_longer(cols = c(Accuracy, Precision, Recall, F1_Score, AUC),
+               names_to = "Metric", values_to = "Value")
 
-# XGBoost feature importance
-importance_matrix <- xgb.importance(feature_names = colnames(X_train_numeric), model = xgb_model)
-print("XGBoost Feature Importance:")
-print(importance_matrix)
+ggplot(model_comparison_long, aes(x = Model, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(title = "Model Performance Comparison", x = "Model", y = "Score") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette = "Set1")
 
-# Random Forest feature importance
-rf_importance <- importance(model_rf)
-print("Random Forest Feature Importance:")
-print(rf_importance)
 
-# Plot XGBoost feature importance
-png("xgboost_feature_importance.png", width=800, height=600)
-xgb.plot.importance(importance_matrix, top_n = 20)
-dev.off()
+# Confusion Matrix Visualization for Best Model
+# Find the best model based on AUC
+best_model_name <- model_comparison$Model[which.max(model_comparison$AUC)]
+best_conf_mat <- get(paste0("conf_mat_", tolower(gsub(" ", "", best_model_name))))
 
-# Plot Random Forest feature importance
-rf_importance_df <- as.data.frame(rf_importance)
-rf_importance_df$feature <- rownames(rf_importance_df)
-rf_importance_df <- rf_importance_df[order(rf_importance_df$MeanDecreaseGini, decreasing = TRUE),]
+conf_mat_df <- as.data.frame(best_conf_mat$table)
+colnames(conf_mat_df) <- c("Reference", "Prediction", "Freq")
 
-png("randomforest_feature_importance.png", width=800, height=600)
-ggplot(rf_importance_df[1:20,], aes(x = reorder(feature, MeanDecreaseGini), y = MeanDecreaseGini)) +
-  geom_bar(stat = "identity", fill = "steelblue") +
-  coord_flip() +
-  labs(title = "Random Forest Feature Importance", x = "Feature", y = "Mean Decrease Gini") +
+ggplot(conf_mat_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "white", size = 12) +
+  scale_fill_gradient(low = "blue", high = "red") +
+  labs(title = paste("Confusion Matrix -", best_model_name), x = "Actual", y = "Predicted") +
   theme_minimal()
-dev.off()
