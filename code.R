@@ -856,6 +856,7 @@ lr_cv_model <- train(
 lr_best_alpha <- lr_cv_model$bestTune$alpha
 lr_best_lambda <- lr_cv_model$bestTune$lambda
 
+
 cat("\nLogistic Regression Best Parameters:\n")
 cat("Alpha:", lr_best_alpha, "\n")
 cat("Lambda:", lr_best_lambda, "\n")
@@ -868,6 +869,9 @@ lr_results <- evaluate_model(
   "Logistic Regression", 
   prob_method = "prob"
 )
+
+conf_mat_lr <- lr_results$conf_mat
+auc_lr <- lr_results$auc
 
 # Store cross-validation results
 cv_results_list[["Logistic Regression"]] <- lr_cv_model$results
@@ -898,6 +902,7 @@ svm_cv_model <- train(
 svm_best_sigma <- svm_cv_model$bestTune$sigma
 svm_best_C <- svm_cv_model$bestTune$C
 
+
 cat("\nSVM Best Parameters:\n")
 cat("Sigma:", svm_best_sigma, "\n")
 cat("C:", svm_best_C, "\n")
@@ -910,6 +915,9 @@ svm_results <- evaluate_model(
   "SVM", 
   prob_method = "prob"
 )
+
+conf_mat_svm <- svm_results$conf_mat
+auc_svm <- svm_results$auc
 
 # Store cross-validation results
 cv_results_list[["SVM"]] <- svm_cv_model$results
@@ -948,6 +956,9 @@ dt_results <- evaluate_model(
   "Decision Tree", 
   prob_method = "prob"
 )
+
+conf_mat_dt <- dt_results$conf_mat
+auc_dt <- dt_results$auc
 
 # Store cross-validation results
 cv_results_list[["Decision Tree"]] <- dt_cv_model$results
@@ -993,6 +1004,9 @@ rf_results <- evaluate_model(
   "Random Forest", 
   prob_method = "prob"
 )
+
+conf_mat_rf <- rf_results$conf_mat
+auc_rf <- rf_results$auc
 
 # Store cross-validation results
 cv_results_list[["Random Forest"]] <- rf_cv_model$results
@@ -1194,3 +1208,4 @@ ggplot(conf_mat_df, aes(x = Reference, y = Prediction, fill = Freq)) +
   scale_fill_gradient(low = "blue", high = "red") +
   labs(title = paste("Confusion Matrix -", best_model_name), x = "Actual", y = "Predicted") +
   theme_minimal()
+
