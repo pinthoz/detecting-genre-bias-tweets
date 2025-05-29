@@ -1,55 +1,35 @@
 ```mermaid 
-flowchart TD
-    %% Data Loading & Preprocessing
-    A[Load Data] --> B[Normalize Labels]
-    B --> C[Group by Tweet & Resolve Annotations]
-    C --> D[Preprocess Text]
+flowchart LR
+ subgraph c1["🤖 Classifier Pipeline"]
+        A["📥 Load & Normalize Data • Load EXIST2025_train.csv and dev set • Convert label_task1_1 to lowercase"]
+        B["🧾 Group & Preprocess • Group tweets by ID • Resolve multi-annotations via majority vote • Remove ties and compute agreement • Clean text: HTML, usernames, URLs, stopwords, numbers, stemming"]
+        C["🛠️ Feature Engineering • Keywords: gender/insult terms • Collocations: n-gram patterns by class • Sentiment: score, variance, binary flags • Emotions (NRC): 8 emotions + ratios • Linguistics: length, diversity, caps, punctuation • Stats: tweet/word count"]
+        D["🎯 Feature Selection & Balancing • Select top 50 features from all categories • Handle imbalance with SMOTE (synthetic oversampling)"]
+        E["📐 Standardization • Apply Z-score normalization on numerical features"]
+        F["🤖 Model Training • 5-Fold Cross-Validation • Models: Logistic Regression (Elastic Net), SVM (RBF), Decision Tree, Random Forest, XGBoost, GBM"]
+        G["🔍 Evaluation • Grid search for hyperparameters (e.g., alpha, C, depth) • Evaluate using accuracy, precision, recall, F1, AUC, confusion matrix"]
+        H["🏆 Select Best Model • Choose model with best F1 results"]
+  end
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+    E --> F
+    F --> G
+    G --> H
+    H -. 🔁 Iterate to achieve better results .-> D
+     A:::container
+     B:::container
+     C:::container
+     D:::container
+     E:::container
+     F:::container
+     G:::container
+     H:::container
+    classDef container fill:#e0f7fa,stroke:#00838f,color:#004d40,stroke-width:2px
+    classDef boundary fill:#ffffff,stroke:#006064,stroke-width:3px,stroke-dasharray:5 5,color:#000000
+    style c1 stroke:none
 
-    %% Feature Engineering
-    D --> E[Extract Features]
-    E --> E1[Keywords & Collocations]
-    E --> E2[Sentiment & Emotions]
-    E --> E3[Linguistic Stats]
-    E --> E4[Text Length & Complexity]
-
-    %% Feature Selection & Balancing
-    E1 --> F[Select Features]
-    E2 --> F
-    E3 --> F
-    E4 --> F
-    F --> G[Handle Class Imbalance]
-    G --> H[Standardize Features]
-
-    %% Model Training
-    H --> I[Train Models: 5-Fold CV]
-    I --> I1[Logistic Regression]
-    I --> I2[SVM]
-    I --> I3[Decision Tree]
-    I --> I4[Random Forest]
-    I --> I5[XGBoost]
-    I --> I6[GBM]
-
-    %% Evaluation & Selection
-    I1 --> J[Evaluate Models]
-    I2 --> J
-    I3 --> J
-    I4 --> J
-    I5 --> J
-    I6 --> J
-    J --> K[Compare Performance]
-    K --> L[Select Best Model]
-
-    %% Styling
-    classDef dataNode fill:#e1f5fe,stroke:#01579b,stroke-width:2px
-    classDef processNode fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
-    classDef featureNode fill:#e8f5e8,stroke:#1b5e20,stroke-width:2px
-    classDef modelNode fill:#fff3e0,stroke:#e65100,stroke-width:2px
-    classDef evalNode fill:#fce4ec,stroke:#880e4f,stroke-width:2px
-
-    class A,B,C,D dataNode
-    class E,E1,E2,E3,E4,F,G,H featureNode
-    class I,I1,I2,I3,I4,I5,I6 modelNode
-    class J,K,L evalNode
 
 
 ```

@@ -9,6 +9,7 @@ library(caret)
 library(ggplot2)
 library(pROC) # For AUC and ROC curves
 library(gridExtra) # For arranging ggplots
+library(dplyr)
 
 # --- 1. Enhanced Data Loading and Preprocessing ---
 data <- read.csv("data/EXIST2025_train.csv", stringsAsFactors = FALSE)
@@ -16,14 +17,14 @@ data$label_numeric <- ifelse(data$label_task1_1 == "YES", 1, 0)
 
 # Create comprehensive annotator and tweet mappings
 annotator_mapping <- data %>%
-  select(annotator_id) %>%
+  dplyr::select(annotator_id) %>%
   distinct() %>%
-  mutate(annotator_numeric = row_number())
+  dplyr::mutate(annotator_numeric = row_number())
 
 tweet_mapping <- data %>%
-  select(id_EXIST) %>%
+  dplyr::select(id_EXIST) %>%
   distinct() %>%
-  mutate(tweet_numeric = row_number())
+  dplyr::mutate(tweet_numeric = row_number())
 
 # Enhanced data with proper mappings
 data_enhanced <- data %>%
@@ -131,16 +132,15 @@ cf_test_unknown <- getData(eval_scheme, "unknown")
 cf_train_df_raw <- as(cf_train_rrm, "data.frame")
 colnames(cf_train_df_raw) <- c("annotator_numeric_str", "tweet_numeric_str", "label_numeric")
 cf_train_df <- cf_train_df_raw %>%
-  mutate(
+  dplyr::mutate(
     annotator_numeric = as.numeric(gsub("u", "", annotator_numeric_str)),
     tweet_numeric = as.numeric(gsub("t", "", tweet_numeric_str))
   ) %>%
-  left_join(annotator_mapping %>% select(annotator_id, annotator_numeric), by = "annotator_numeric") %>%
-  left_join(tweet_mapping %>% select(id_EXIST, tweet_numeric), by = "tweet_numeric")
+  left_join(annotator_mapping %>% dplyr::select(annotator_id, annotator_numeric), by = "annotator_numeric") %>%
+  left_join(tweet_mapping %>% dplyr::select(id_EXIST, tweet_numeric), by = "tweet_numeric")
 
 cf_evaluation_profiles <- calculate_profiles_from_data(cf_train_df)
 annotator_profiles_for_cf_eval <- cf_evaluation_profiles$annotator_profiles
-# tweet_profiles_for_cf_eval <- cf_evaluation_profiles$tweet_profiles # If needed
 
 
 # --- 5. Model Training with Parameter Tuning ---
@@ -161,6 +161,7 @@ pred_ubcf <- predict(model_ubcf, cf_test_known, type = "ratings")
 pred_ibcf <- predict(model_ibcf, cf_test_known, type = "ratings")
 pred_svd <- predict(model_svd, cf_test_known, type = "ratings")
 pred_random <- predict(model_random, cf_test_known, type = "ratings")
+
 
 # Enhanced dense matrix conversion
 get_dense_matrix_safe <- function(pred_obj, ref_dimnames, default_value = 0) {
@@ -223,12 +224,22 @@ mat_hybrid_bias_adjusted <- matrix(mat_hybrid_bias_adjusted,
                                    dimnames = dimnames(cf_test_known))
 
 calculate_prediction_confidence <- function(matrices_list) {
-  pred_array <- array(unlist(matrices_list), dim = c(nrow(matrices_list[[1]]), ncol(matrices_list[[1]]), length(matrices_list)))
+  dimnames_ref <- dimnames(matrices_list[[1]])
+  
+  pred_array <- array(unlist(matrices_list), 
+                      dim = c(nrow(matrices_list[[1]]), 
+                              ncol(matrices_list[[1]]), 
+                              length(matrices_list)))
+  
   pred_var <- apply(pred_array, c(1, 2), var, na.rm = TRUE)
-  pred_var[is.na(pred_var)] <- 0 # If only one model or all same, var is NA, treat as 0 variance
-  confidence <- 1 / (1 + pred_var) 
+  pred_var[is.na(pred_var)] <- 0
+  
+  confidence <- 1 / (1 + pred_var)
+  dimnames(confidence) <- dimnames_ref 
+  
   return(confidence)
 }
+
 all_pred_matrices_for_confidence <- list(mat_popular, mat_ubcf, mat_ibcf, mat_svd)
 confidence_map <- calculate_prediction_confidence(all_pred_matrices_for_confidence)
 
@@ -303,19 +314,26 @@ evaluate_model_comprehensive <- function(aligned_ratings, model_name) {
   
   rmse_val <- rmse(aligned_ratings$trues, aligned_ratings$preds)
   auc_val <- tryCatch({
-    if (length(unique(aligned_ratings$trues)) < 2) {NA_real_} 
-    else { 
-      roc_obj <- roc(response = aligned_ratings$trues, 
-                     predictor = aligned_ratings$preds, 
-                     quiet = TRUE, 
-                     levels = c(0,1), # Control group is 0, Case group is 1
-                     direction = "<") # CORRECTED: Predictor is higher for cases (1) than controls (0)
-      as.numeric(auc(roc_obj))
+    preds <- as.numeric(aligned_ratings$preds)
+    trues <- as.numeric(aligned_ratings$trues)
+    
+    if (length(unique(trues)) < 2) {
+      warning(paste("AUC calculation skipped for model:", model_name, "due to insufficient label diversity."))
+      return(NA_real_)
     }
+    
+    roc_obj <- pROC::roc(response = trues,
+                         predictor = preds,
+                         levels = c(0, 1),
+                         direction = "<",
+                         quiet = TRUE)
+    as.numeric(pROC::auc(roc_obj))
+    
   }, error = function(e) {
     warning(paste("AUC calculation failed for model:", model_name, "Error:", e$message))
-    NA_real_ 
+    return(NA_real_)
   })
+  
   
   thresholds <- c(0.3, 0.4, 0.5, 0.6, 0.7)
   results_list <- lapply(thresholds, function(thresh) {
@@ -364,11 +382,15 @@ cat("\nBest Overall Model (CF Eval at Threshold 0.5):\n"); print(best_overall_cf
 p1 <- ggplot(all_results %>% filter(!is.na(F1)), aes(x = Threshold, y = F1, color = Model, group = Model)) +
   geom_line(size = 1) + geom_point(size = 2) + labs(title = "F1 Score vs Threshold (CF Eval)", y = "F1 Score") + theme_minimal() + theme(legend.position = "bottom")
 
-auc_summary <- all_results %>% distinct(Model, .keep_all = TRUE) %>% select(Model, AUC) %>% filter(!is.na(AUC))
+auc_summary <- all_results %>% 
+  dplyr::distinct(Model, .keep_all = TRUE) %>% 
+  dplyr::select(Model, AUC) %>% 
+  dplyr::filter(!is.na(AUC))
+
 p2 <- ggplot(auc_summary, aes(x = reorder(Model, AUC), y = AUC)) + geom_bar(stat = "identity", fill = "steelblue") +
   coord_flip() + labs(title = "AUC Comparison (CF Eval)", x = "Model") + theme_minimal()
 
-rmse_summary <- all_results %>% distinct(Model, .keep_all = TRUE) %>% select(Model, RMSE) %>% filter(!is.na(RMSE))
+rmse_summary <- all_results %>% dplyr::distinct(Model, .keep_all = TRUE) %>% dplyr::select(Model, RMSE) %>% dplyr::filter(!is.na(RMSE))
 p3 <- ggplot(rmse_summary, aes(x = reorder(Model, -RMSE), y = RMSE)) + geom_bar(stat = "identity", fill = "coral") +
   coord_flip() + labs(title = "RMSE Comparison (CF Eval)", x = "Model") + theme_minimal()
 
@@ -376,175 +398,140 @@ grid.arrange(p1, p2, p3, ncol = 2)
 
 
 # --- 11. Feature Integration for Main Classifier ---
-cat("\n=== Generating Features for Main Classifier (using full train_data) ===\n")
-cat("Training full models on train_rrm for feature generation...\n")
-# Models are trained on train_rrm (derived from 80% train_data)
-full_model_popular <- Recommender(train_rrm, method = "POPULAR") # train_rrm is the full training data matrix
-full_model_ubcf    <- Recommender(train_rrm, method = "UBCF", parameter = list(method = "cosine", nn = 25, normalize = "center"))
-full_model_ibcf    <- Recommender(train_rrm, method = "IBCF", parameter = list(method = "cosine", k = 30, normalize = "center"))
-full_model_svd     <- Recommender(train_rrm, method = "SVD",  parameter = list(k = 25, gamma = 0.015, lambda = 0.001))
+# --- Demographic Feature Extraction for Annotators ---
 
-generate_recommendation_features <- function(target_data_df, # e.g. train_data, test_data, dev_data
-                                             trained_models_list, 
-                                             annot_profiles_train, # Annotator profiles from training set
-                                             tweet_profiles_train, # Tweet profiles from training set
-                                             global_annot_map, global_tweet_map,
-                                             data_type_label = "test") {
-  # Adiciona identificador de linha
-  target_data_df <- target_data_df %>% mutate(row_id = row_number())
-  cat("Generating", data_type_label, "features for", nrow(target_data_df), "annotations...\n")
-  
-  # Cria matriz de predição "vazia" com todos os usuários e tweets conhecidos
-  target_matrix_shell <- sparseMatrix(
-    i = target_data_df$annotator_numeric,
-    j = target_data_df$tweet_numeric,
-    x = rep(NA_real_, nrow(target_data_df)),  
-    dims = c(nrow(global_annot_map), nrow(global_tweet_map)),
-    dimnames = list(
-      paste0("u", global_annot_map$annotator_numeric), 
-      paste0("t", global_tweet_map$tweet_numeric)
-    )
+annotator_demographics <- data %>%
+  dplyr::select(annotator_id, gender, age, ethnicity, education, country) %>%
+  distinct()
+
+# Encode demographics numerically
+annotator_demo_encoded <- annotator_demographics %>%
+  mutate(
+    gender_numeric = as.numeric(factor(gender)),
+    age_numeric = case_when(
+      age == "18-22" ~ 1,
+      age == "23-45" ~ 2,
+      age == "46+" ~ 3,
+      TRUE ~ NA_real_
+    ),
+    ethnicity_numeric = as.numeric(factor(ethnicity)),
+    education_numeric = as.numeric(factor(education)),
+    country_numeric = as.numeric(factor(country))
+  ) %>%
+  dplyr::select(annotator_id, gender_numeric, age_numeric, ethnicity_numeric, education_numeric, country_numeric)
+
+# Join with annotator mapping to get numeric IDs
+annotator_features_demographics <- annotator_mapping %>%
+  left_join(annotator_demo_encoded, by = "annotator_id")
+
+annotator_bias_model_data <- global_annotator_profiles %>%
+  left_join(annotator_features_demographics, by = "annotator_id")
+
+# Drop NAs and fit a linear model to predict bias from demographics
+annotator_bias_model_data <- annotator_bias_model_data %>%
+  filter(!is.na(sexist_rate), !is.na(gender_numeric), !is.na(age_numeric))
+
+# Fit a regression model to predict annotator bias (sexist_rate) from demographics
+annotator_bias_model <- lm(sexist_rate ~ gender_numeric + age_numeric + ethnicity_numeric +
+                             education_numeric + country_numeric, data = annotator_bias_model_data)
+
+# View model summary (optional)
+summary(annotator_bias_model)
+
+# --- Predict expected bias from demographics (can be used for cold-start annotators) ---
+annotator_features_demographics$predicted_sexist_rate <- predict(annotator_bias_model, newdata = annotator_features_demographics)
+
+# Clip predictions between 0 and 1
+annotator_features_demographics$predicted_sexist_rate <- pmin(pmax(annotator_features_demographics$predicted_sexist_rate, 0), 1)
+
+# Join bias info with demographic features
+annotator_bias_model_data <- global_annotator_profiles %>%
+  left_join(annotator_features_demographics, by = "annotator_id")
+
+# Drop NAs and fit a linear model to predict bias from demographics
+annotator_bias_model_data <- annotator_bias_model_data %>%
+  filter(!is.na(sexist_rate), !is.na(gender_numeric), !is.na(age_numeric))
+
+# Fit a regression model to predict annotator bias (sexist_rate) from demographics
+annotator_bias_model <- lm(sexist_rate ~ gender_numeric + age_numeric + ethnicity_numeric +
+                             education_numeric + country_numeric, data = annotator_bias_model_data)
+
+# View model summary (optional)
+summary(annotator_bias_model)
+
+# --- Predict expected bias from demographics (can be used for cold-start annotators) ---
+annotator_features_demographics$predicted_sexist_rate <- predict(annotator_bias_model, newdata = annotator_features_demographics)
+
+# Clip predictions between 0 and 1
+annotator_features_demographics$predicted_sexist_rate <- pmin(pmax(annotator_features_demographics$predicted_sexist_rate, 0), 1)
+
+# View enhanced annotator profile
+head(annotator_features_demographics)
+
+# 1. Annotator-specific interaction richness
+annotator_interactions <- data_enhanced %>%
+  group_by(annotator_numeric) %>%
+  summarise(
+    mean_label = mean(label_numeric),
+    label_variance = if(n() > 1) var(label_numeric) else NA_real_,
+    label_entropy = -sum(prop.table(table(label_numeric)) * log2(prop.table(table(label_numeric)))),
+    .groups = "drop"
   )
-  target_rrm_shell <- new("realRatingMatrix", data = target_matrix_shell)
-  target_rrm_shell <- new("realRatingMatrix", data = target_matrix_shell)
-  
-  target_dimnames_feat <- dimnames(target_rrm_shell)
-  pred_features_df <- data.frame(row_id = 1:nrow(target_data_df))
-  
-  # Geração de features por modelo
-  for (model_name in names(trained_models_list)) {
-    cat("  Predicting with", model_name, "for", data_type_label, "set...\n")
-    preds_obj <- predict(trained_models_list[[model_name]], target_rrm_shell, type = "ratings")
-    pred_dense_m <- get_dense_matrix_safe(preds_obj, target_dimnames_feat, 0.5)
-    
-    feature_values <- sapply(1:nrow(target_data_df), function(k) {
-      ann_idx_str <- paste0("u", target_data_df$annotator_numeric[k])
-      tweet_idx_str <- paste0("t", target_data_df$tweet_numeric[k])
-      if (ann_idx_str %in% rownames(pred_dense_m) && tweet_idx_str %in% colnames(pred_dense_m)) {
-        return(pred_dense_m[ann_idx_str, tweet_idx_str])
-      } else {
-        return(0.5) # valor neutro
-      }
-    })
-    
-    pred_features_df[[paste0(model_name, "_pred")]] <- feature_values
-  }
-  
-  # Adiciona viés do anotador
-  pred_features_df <- pred_features_df %>%
-    left_join(target_data_df %>% select(row_id, annotator_numeric), by = "row_id") %>%
-    left_join(annot_profiles_train %>% select(annotator_numeric, annotator_bias = sexist_rate), by = "annotator_numeric") %>%
-    mutate(annotator_bias = ifelse(is.na(annotator_bias), 0.5, annotator_bias)) # padrão neutro
-  
-  # Adiciona dificuldade e concordância do tweet
-  pred_features_df <- pred_features_df %>%
-    left_join(target_data_df %>% select(row_id, tweet_numeric), by = "row_id") %>%
-    left_join(tweet_profiles_train %>% select(tweet_numeric, tweet_difficulty = difficulty, tweet_agreement = agreement_rate), by = "tweet_numeric") %>%
-    mutate(
-      tweet_difficulty = ifelse(is.na(tweet_difficulty), 0.5, tweet_difficulty),
-      tweet_agreement = ifelse(is.na(tweet_agreement), 0.5, tweet_agreement)
-    )
-  
-  # Limpa colunas temporárias
-  pred_features_df <- pred_features_df %>%
-    select(-row_id, -annotator_numeric, -tweet_numeric)
-  
-  return(pred_features_df)
-}
+
+# 2. Create demographic similarity matrix (Euclidean in demo feature space)
+annotator_demo_matrix <- annotator_features_demographics %>%
+  dplyr::select(gender_numeric, age_numeric, ethnicity_numeric, education_numeric, country_numeric) %>%
+  as.matrix()
+rownames(annotator_demo_matrix) <- annotator_features_demographics$annotator_numeric
+
+# Compute pairwise distance (you can use cosine or euclidean)
+demo_dist_matrix <- as.matrix(dist(annotator_demo_matrix, method = "euclidean"))
+
+# 3. For each annotator, compute mean predicted_sexist_rate of k nearest demographic neighbors
+k <- 4
+knn_bias_feature <- sapply(1:nrow(demo_dist_matrix), function(i) {
+  neighbor_ids <- order(demo_dist_matrix[i, ])[2:(k + 1)]  # skip self (first one)
+  mean(annotator_features_demographics$predicted_sexist_rate[neighbor_ids], na.rm = TRUE)
+})
+annotator_features_demographics$demographic_knn_bias <- knn_bias_feature
 
 
-# Generate features for the main test set (test_data)
-models_for_features <- list(
-  "POPULAR_Full" = full_model_popular, "UBCF_Full" = full_model_ubcf,
-  "IBCF_Full" = full_model_ibcf, "SVD_Full" = full_model_svd
-)
+# 4. Confidence in predicted bias (based on similarity agreement)
+bias_confidence <- apply(demo_dist_matrix, 1, function(dist_row) {
+  1 / (1 + mean(dist_row, na.rm = TRUE))
+})
+annotator_features_demographics$bias_confidence <- bias_confidence
 
-# Use annotator_profiles_for_feature_gen and tweet_profiles_for_feature_gen calculated from train_data
-test_rec_features <- generate_recommendation_features(
-  test_data, models_for_features,
-  annotator_profiles_for_feature_gen, tweet_profiles_for_feature_gen,
-  annotator_mapping, tweet_mapping, # Pass global mappings for dims
-  "test"
-)
-
-# Also generate features for the main training set (train_data) for consistent feature sets
-# Important: Models are already trained on train_rrm, so this is like getting 'in-sample' scores
-# For some models (like kNN based), this might result in perfect or near-perfect recall for already rated items.
-# It's often better to use k-fold cross-validation to generate out-of-sample predictions for the training set.
-# However, for simplicity here, we get direct predictions. Be mindful of potential overfitting if using these directly.
-cat("\nNote: Generating 'in-sample' recommendation features for the training set.\n")
-cat("For more robust training features, consider k-fold cross-validated predictions.\n")
-train_rec_features <- generate_recommendation_features(
-  train_data, models_for_features,
-  annotator_profiles_for_feature_gen, tweet_profiles_for_feature_gen,
-  annotator_mapping, tweet_mapping,
-  "train"
-)
-
-# Create ensemble features for both train and test feature sets
-create_ensemble_features <- function(df, annot_bias_col_name = "annotator_bias") {
-  # Ensure columns exist before trying to use them
-  required_preds <- c("POPULAR_Full_pred", "UBCF_Full_pred", "IBCF_Full_pred", "SVD_Full_pred")
-  if (!all(required_preds %in% names(df))) {
-    stop("Missing one or more required base model prediction columns for ensemble features.")
-  }
-  if (!annot_bias_col_name %in% names(df)) {
-    warning(paste("Annotator bias column", annot_bias_col_name, "not found. Bias adjustment will not be effective."))
-    df[[annot_bias_col_name]] <- 0.5 # Add a default if missing
-  }
-  
-  df$HYBRID_SIMPLE_feat <- 0.35 * df$POPULAR_Full_pred + 0.25 * df$UBCF_Full_pred + 
-    0.25 * df$IBCF_Full_pred + 0.15 * df$SVD_Full_pred
-  
-  df$HYBRID_BIAS_ADJ_feat <- 0.7 * df$HYBRID_SIMPLE_feat + 0.3 * df[[annot_bias_col_name]]
-  df$HYBRID_BIAS_ADJ_feat <- pmax(0, pmin(1, df$HYBRID_BIAS_ADJ_feat)) # Clip to [0,1]
-  return(df)
-}
-
-train_rec_features <- create_ensemble_features(train_rec_features)
-test_rec_features  <- create_ensemble_features(test_rec_features)
-
-# Combine with original train/test data
-train_data_with_features <- cbind(train_data, train_rec_features)
-test_data_with_features  <- cbind(test_data,  test_rec_features)
-
-remove_constant_prediction_columns <- function(df) {
-  pred_cols <- grep("_pred$", names(df), value = TRUE)
-  for (col in pred_cols) {
-    if (all(df[[col]] == 0.5)) {
-      message(paste("Removing constant column:", col))
-      df[[col]] <- NULL
-    }
-  }
-  return(df)
-}
-
-train_rec_features <- remove_constant_prediction_columns(train_rec_features)
-test_rec_features  <- remove_constant_prediction_columns(test_rec_features)
-
-head(train_rec_features)
+# Combine everything into one annotator feature set
+annotator_final_features <- annotator_features_demographics %>%
+  left_join(annotator_interactions, by = "annotator_numeric")
 
 
-# For dev dataset:
+annotator_filtered <- annotator_final_features %>%
+  dplyr::select(
+    -annotator_numeric,
+    -gender_numeric,
+    -age_numeric,
+    -ethnicity_numeric,
+    -education_numeric,
+    -country_numeric
+  )
 
-dev_data <- read.csv("data/EXIST2025_dev_labeled.csv", stringsAsFactors = FALSE)
+# View the new features
+head(annotator_filtered)
 
-dev_data$label_numeric <- ifelse(dev_data$label_task1_1 == "YES", 1, 0)
+# Recommendation System Concepts Used
+#Concept	                                  Feature
+#Content-Based Filtering        	predicted_sexist_rate from demographics
+#User-Based CF	                         demographic_knn_bias
+#Confidence                           Modeling	bias_confidence
+#Hybrid RS	                     Blending demographic + CF + tweet info
+#Cold Start Solutions	                Demographics → predictions
 
-dev_data <- dev_data %>%
-  left_join(annotator_mapping, by = "annotator_id") %>%
-  left_join(tweet_mapping, by = "id_EXIST")
 
-dev_rec_features <- generate_recommendation_features(
-  dev_data, models_for_features,
-  annotator_profiles_for_feature_gen, tweet_profiles_for_feature_gen,
-  annotator_mapping, tweet_mapping,
-  "dev"
-)
-
-dev_rec_features <- create_ensemble_features(dev_rec_features)
-
-dev_data_with_features <- cbind(dev_data, dev_rec_features)
-
-cat("Sample of DEV features (first few rows, first few columns):\n")
-print(head(dev_data_with_features[, (ncol(dev_data)+1):min(ncol(dev_data_with_features), ncol(dev_data)+5)], 3))
+# Features Created from Recommender System Concepts
+#Feature Name	RS Concept	Meaning
+#predicted_sexist_rate	Content-based RS	Estimate annotator bias using only demographic features
+#demographic_knn_bias	User-based CF	Average bias of demographically similar annotators
+#bias_confidence	Similarity weight	Confidence in predictions based on demographic similarity (less = risk)
+#mean_label, label_variance, label_entropy	Behavioral profiling	How predictable, stable, and polarized each annotator is
