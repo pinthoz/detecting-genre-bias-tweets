@@ -1,0 +1,1818 @@
+# Task 1: Sexism Identification Classifier
+
+
+# Libraries
+
+library(quanteda)
+library(quanteda.textmodels)
+library(quanteda.textplots)
+library(quanteda.textstats)
+library(readr)
+library(dplyr)
+library(recommenderlab)
+library(syuzhet)
+library(textclean)
+library(stringr)
+library(tidyverse)
+library(gridExtra)
+library(corrplot)
+library(purrr)
+library(Matrix)
+library(caret)
+library(pROC)
+library(e1071)
+library(rpart)
+library(ggplot2)
+library(xgboost)
+library(themis)
+library(recipes)
+library(glmnet)
+library(randomForest)
+library(knitr)        
+library(ggcorrplot)   
+library(scales)      
+library(viridis)      
+library(tidytext)     
+library(ggwordcloud) 
+library(pdp)   
+library(parallel)
+library(doParallel)
+library(rpart.plot)
+library(MLmetrics)
+library(yardstick)
+library(tidyverse)
+
+
+set.seed(123)
+
+theme_set(theme_minimal(base_size = 12) + 
+            theme(
+              plot.title = element_text(face = "bold", size = 14),
+              plot.subtitle = element_text(size = 11),
+              axis.title = element_text(face = "bold"),
+              legend.title = element_text(face = "bold"),
+              panel.grid.minor = element_blank(),
+              panel.border = element_rect(color = "gray80", fill = NA)
+            ))
+
+# Custom colors for consistent visualization
+sexist_colors <- c("no" = "#3498db", "yes" = "#e74c3c")
+
+# Data Loading
+
+train_data <- read_csv("data/EXIST2025_train.csv")
+dev_data <- read_csv("data/EXIST2025_dev_labeled.csv")
+
+# Display dataset information
+message("Dataset Dimensions:")
+data_dims <- data.frame(
+  Dataset = c("Training", "Development"),
+  Rows = c(nrow(train_data), nrow(dev_data)),
+  Columns = c(ncol(train_data), ncol(dev_data))
+)
+kable(data_dims)
+
+
+# Ensure consistent label naming
+train_data$sexist <- tolower(train_data$label_task1_1)
+if("label_task1_1" %in% colnames(dev_data)) {
+  dev_data$sexist <- tolower(dev_data$label_task1_1)
+} else if("sexist" %in% colnames(dev_data)) {
+  dev_data$sexist <- tolower(dev_data$sexist)
+}
+
+# Label distribution visualization
+train_labels <- table(train_data$sexist)
+train_prop <- prop.table(train_labels)
+
+# Create label distribution plot
+ggplot(data.frame(label = names(train_labels), count = as.numeric(train_labels)), 
+       aes(x = label, y = count, fill = label)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  geom_text(aes(label = count), vjust = -0.5, size = 4) +
+  geom_text(aes(label = percent(count/sum(count), accuracy = 0.1)), vjust = 1.5, color = "white", size = 4) +
+  labs(title = "Distribution of Classes in Training Data",
+       subtitle = "Count and percentage of sexist vs. non-sexist tweets",
+       x = "Classification", y = "Count") +
+  scale_fill_manual(values = sexist_colors) +
+  theme(legend.position = "none")
+
+
+# Grouping by tweet (handling multiple annotations)
+
+# Aggregate multiple annotations with majority vote
+train_grouped <- train_data %>%
+  group_by(tweet) %>%
+  summarise(
+    count_yes = sum(sexist == "yes", na.rm = TRUE),
+    count_no = sum(sexist == "no", na.rm = TRUE),
+    annotator_count = n()
+  ) %>%
+  filter(count_yes != count_no) %>% # Remove ties
+  mutate(
+    final_label = ifelse(count_yes > count_no, "yes", "no"),
+    agreement_ratio = pmax(count_yes, count_no) / annotator_count
+  )
+#Grouping dev_data by tweet to create dev_grouped (matching train_grouped logic)
+
+dev_grouped <- dev_data %>%
+  group_by(tweet) %>%
+  summarise( # Note: Original train_grouped summarise didn't have .groups='drop'
+    count_yes = sum(sexist == "yes", na.rm = TRUE),
+    count_no = sum(sexist == "no", na.rm = TRUE),
+    annotator_count = n()
+  ) %>%
+  filter(count_yes != count_no) %>% # Remove ties, same as for train_grouped
+  mutate(
+    final_label = ifelse(count_yes > count_no, "yes", "no"),
+    agreement_ratio = pmax(count_yes, count_no) / annotator_count
+  )
+
+# Analyze annotation agreement
+agreement_summary <- train_grouped %>%
+  group_by(final_label) %>%
+  summarise(
+    n = n(),
+    mean_agreement = mean(agreement_ratio),
+    median_agreement = median(agreement_ratio)
+  )
+
+# Visualize annotator agreement by class
+ggplot(train_grouped, aes(x = agreement_ratio, fill = final_label)) +
+  geom_histogram(binwidth = 0.05, position = "dodge", alpha = 0.8) +
+  labs(title = "Annotator Agreement by Class",
+       subtitle = "Higher values indicate stronger consensus among annotators",
+       x = "Agreement Ratio", y = "Count", fill = "Classification") +
+  scale_fill_manual(values = sexist_colors) +
+  facet_wrap(~final_label, scales = "free_y") +
+  scale_x_continuous(limits = c(0.5, 1), breaks = seq(0.5, 1, 0.1))
+
+# Display label distribution after grouping
+final_label_dist <- table(train_grouped$final_label)
+kable(data.frame(
+  Class = names(final_label_dist),
+  Count = as.numeric(final_label_dist),
+  Percentage = percent(as.numeric(final_label_dist) / sum(final_label_dist))
+), caption = "Final Label Distribution After Grouping")
+
+
+# Text Pre-processing Functions
+
+# Function for cleaning, tokenizing, removing stop words, numbers, and applying stemming
+process_tweets <- function(tweets) {
+  # Initial cleaning
+  tweets <- replace_html(tweets)                             # expose ampersands (&) to be removed later
+  tweets <- str_replace_all(tweets, "@\\w+", "USER")         # replace usernames with USER token
+  tweets <- str_replace_all(tweets, "http\\S+", "URL")       # replace links with URL token
+  tweets <- str_replace_all(tweets, "\\.(\\S)", ". \\1")     # add space after dots
+  # Create corpus
+  corpus <- corpus(tweets)
+  # Tokenize with careful handling of important features
+  toks <- tokens(
+    corpus,
+    remove_punct = TRUE,
+    remove_symbols = TRUE,
+    what = "word"
+  )
+  # Normalize text
+  toks <- tokens_tolower(toks)
+  toks <- tokens_remove(toks, stopwords("english"))
+  toks <- tokens_remove(toks, pattern = "^\\d+$", valuetype = "regex")
+  toks <- tokens_wordstem(toks)
+  
+  return(toks)
+}
+
+# Function to extract n-grams from text
+extract_ngrams <- function(text, n = 2) {
+  toks <- tokens(text)
+  toks_ngrams <- tokens_ngrams(toks, n = n)
+  return(toks_ngrams)
+}
+
+# Text Processing and Initial Analysis
+
+# Create a corpus for analysis and visualization
+tweet_corpus <- corpus(train_grouped$tweet)
+
+# Sample of tweets
+cat("Sample tweets:\n")
+head(as.character(tweet_corpus), 3)
+
+# Process tweets
+toks <- process_tweets(train_grouped$tweet)
+dfm <- dfm(toks)
+dfm_tfidf <- dfm_tfidf(dfm)
+
+# Extract top features from the dfm and assign them properly
+top_features <- topfeatures(dfm, 20)
+
+# Now this will work
+top_features_df <- data.frame(
+  word = names(top_features),
+  frequency = as.numeric(top_features)
+)
+
+ggplot(top_features_df, aes(x = reorder(word, frequency), y = frequency)) +
+  geom_col(fill = "#1f77b4") +
+  coord_flip() +
+  labs(
+    title = "Most Frequent Terms in Processed Text",
+    subtitle = "After removing stopwords and stemming",
+    x = "Term", y = "Frequency"
+  )
+
+ggplot(top_features_df[1:100,], aes(label = word, size = frequency, color = frequency)) +
+  geom_text_wordcloud_area() +
+  scale_size_area(max_size = 15) +
+  scale_color_viridis_c() +
+  theme_minimal() +
+  labs(title = "Word Cloud of Most Frequent Terms")
+
+# Feature Engineering: Important Words
+
+# Analyze important words for each class
+dfm_yes <- dfm_subset(dfm_tfidf, train_grouped$final_label == "yes")
+dfm_no <- dfm_subset(dfm_tfidf, train_grouped$final_label == "no")
+
+top_yes <- topfeatures(dfm_yes, 30)
+top_no <- topfeatures(dfm_no, 30)
+
+cat("Top words in 'YES' tweets:\n")
+print(top_yes)
+cat("\nTop words in 'NO' tweets:\n")
+print(top_no)
+
+# Count documents in each class
+n_yes <- ndoc(dfm_yes)
+n_no <- ndoc(dfm_no)
+
+# Calculate relative frequencies with keyness statistics
+keyness <- textstat_keyness(dfm, train_grouped$final_label == "yes")
+keyness_df <- data.frame(keyness)
+keyness_df$significant <- ifelse(keyness_df$p < 0.05, "Yes", "No")
+
+# Class-specific words with relative frequencies
+df_yes <- data.frame(word = names(top_yes), count = as.numeric(top_yes)) %>%
+  mutate(relative_count = count / n_yes,
+         class = "Sexist") %>%
+  arrange(desc(relative_count))
+
+df_no <- data.frame(word = names(top_no), count = as.numeric(top_no)) %>%
+  mutate(relative_count = count / n_no,
+         class = "Non-sexist") %>%
+  arrange(desc(relative_count))
+
+# Combined dataframe for visualization
+class_words <- rbind(df_yes[1:15,], df_no[1:15,])
+
+# Visualize class-specific words with better formatting
+ggplot(class_words, aes(x = reorder(word, relative_count), y = relative_count, fill = class)) +
+  geom_col() +
+  facet_wrap(~ class, scales = "free_y") +
+  coord_flip() +
+  scale_fill_manual(values = c("Sexist" = "#e74c3c", "Non-sexist" = "#3498db")) +
+  labs(title = "Most Characteristic Words by Class",
+       subtitle = "TF-IDF weighted relative frequencies",
+       x = "Word", y = "Relative Frequency") +
+  theme(legend.position = "none")
+
+# Visualize keyness statistics
+ggplot(head(keyness_df, 20), aes(x = reorder(feature, chi2), y = chi2, fill = chi2 > 0)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = "#e74c3c", "FALSE" = "#3498db"), 
+                    labels = c("Associated with sexist", "Associated with non-sexist")) +
+  labs(title = "Keyness Statistics: Words Associated with Classes",
+       subtitle = "Chi-squared values indicating word-class associations",
+       x = "Word", y = "Chi-squared value", fill = "Association") +
+  theme(legend.position = "bottom")
+
+important_words <- function(df, tweet_col = "tweet") {
+  # Expanded list of important words identified from keyness analysis
+  words <- c("woman", "women", "men", "girl", "sex", "bitch", "fuck",
+             "love", "peopl", "gender", "femal", "male", "stupid", 
+             "kitchen", "joke", "victim", "harass", "equal", "feminist")
+  
+  df_copy <- df
+  tweets_lower <- tolower(df_copy[[tweet_col]])
+  
+  for (word in words) {
+    col_name <- word
+    # Replace fixed() with a regular expression pattern
+    df_copy[[col_name]] <- as.integer(str_detect(tweets_lower, paste0("\\b", word, "\\b")))
+  }
+  
+  return(df_copy)
+}
+
+# Function to analyze context of key words
+analyze_context <- function(tokens, target_word, window = 3) {
+  tokens_context <- tokens_select(tokens, pattern = target_word, selection = "keep", 
+                                  window = window)
+  dfm_context <- dfm(tokens_context)
+  context_features <- topfeatures(dfm_context, 10)
+  return(context_features)
+}
+
+# Analyze collocations (word pairs) for each class
+tweets_yes <- train_grouped %>% filter(final_label == "yes") %>% pull(tweet)
+tweets_no <- train_grouped %>% filter(final_label == "no") %>% pull(tweet)
+
+toks_yes <- process_tweets(tweets_yes)
+toks_no <- process_tweets(tweets_no)
+
+# Analyze bigrams (more interpretable than collocations)
+dfm_yes_bigrams <- dfm(tokens_ngrams(toks_yes, n = 2))
+dfm_no_bigrams <- dfm(tokens_ngrams(toks_no, n = 2))
+
+top_bigrams_yes <- topfeatures(dfm_yes_bigrams, 20)
+top_bigrams_no <- topfeatures(dfm_no_bigrams, 20)
+
+# Create data frames for visualization
+bigrams_yes_df <- data.frame(
+  bigram = names(top_bigrams_yes),
+  count = as.numeric(top_bigrams_yes),
+  class = "Sexist"
+) %>% arrange(desc(count))
+
+bigrams_no_df <- data.frame(
+  bigram = names(top_bigrams_no),
+  count = as.numeric(top_bigrams_no),
+  class = "Non-sexist"
+) %>% arrange(desc(count))
+
+# Combine data frames
+bigrams_df <- rbind(
+  head(bigrams_yes_df, 10),
+  head(bigrams_no_df, 10)
+)
+
+# Visualize top bigrams by class
+ggplot(bigrams_df, aes(x = reorder(bigram, count), y = count, fill = class)) +
+  geom_col() +
+  facet_wrap(~ class, scales = "free_y") +
+  coord_flip() +
+  scale_fill_manual(values = c("Sexist" = "#e74c3c", "Non-sexist" = "#3498db")) +
+  labs(title = "Most Common Bigrams by Class",
+       subtitle = "Frequency of word pairs in each class",
+       x = "Bigram", y = "Count") +
+  theme(legend.position = "none")
+
+# Function to create enhanced collocation features
+coloc <- function(df) {
+  # Extract most significant collocations for each class
+  collocs_yes <- textstat_collocations(toks_yes, size = 2, min_count = 5)
+  collocs_no <- textstat_collocations(toks_no, size = 2, min_count = 5)
+  
+  # Get top collocations by effect size (higher lambda means stronger association)
+  collocations_yes <- collocs_yes %>% 
+    arrange(desc(lambda)) %>% 
+    head(15) %>% 
+    pull(collocation)
+  
+  collocations_no <- collocs_no %>% 
+    arrange(desc(lambda)) %>% 
+    head(15) %>% 
+    pull(collocation)
+  
+  # Create binary features for each top collocation
+  df$sexist_colloc_count <- 0
+  df$non_sexist_colloc_count <- 0
+  
+  for (colloc in collocations_yes) {
+    col_name <- paste0("yes_", gsub(" ", "_", colloc))
+    
+    df[[col_name]] <- as.integer(str_detect(tolower(df$tweet), colloc))  
+    df$sexist_colloc_count <- df$sexist_colloc_count + df[[col_name]]
+  }
+  
+  for (colloc in collocations_no) {
+    col_name <- paste0("no_", gsub(" ", "_", colloc))
+    
+    df[[col_name]] <- as.integer(str_detect(tolower(df$tweet), colloc)) 
+    df$non_sexist_colloc_count <- df$non_sexist_colloc_count + df[[col_name]]
+  }
+  
+  return(df)
+}
+
+
+# Feature Engineering: Sentiment and Emotion Analysis
+
+# Function to analyze sentiment sequences
+sent_seq <- function(data) {
+  data$tweet <- as.character(data$tweet)
+  sentiment_results <- data.frame(tweet = data$tweet)
+  # Extract sentences
+  sentences_per_tweet <- lapply(data$tweet, get_sentences)
+  # Calculate overall sentiment
+  sentiment_results$overall_sentiment <- get_sentiment(data$tweet, method = "syuzhet")
+  # Calculate sentence-level sentiment
+  sentiments_per_tweet <- lapply(sentences_per_tweet, get_sentiment, method = "syuzhet")
+  # Calculate sentiment patterns
+  sentiment_results$sentiment_variance <- sapply(sentiments_per_tweet, function(s) {
+    if (length(s) > 1) var(s) else 0
+  })
+  sentiment_results$sentiment_range <- sapply(sentiments_per_tweet, function(s) {
+    if (length(s) > 1) max(s) - min(s) else 0
+  })
+  sentiment_results$sentiment_shift <- sapply(sentiments_per_tweet, function(s) {
+    if (length(s) > 1) s[length(s)] - s[1] else 0
+  })
+  sentiment_results$all_pos <- sapply(sentiments_per_tweet, function(sentiments) {
+    if (length(sentiments) > 0 && all(sign(sentiments) == 1)) 1 else 0
+  })
+  sentiment_results$all_neg <- sapply(sentiments_per_tweet, function(sentiments) {
+    if (length(sentiments) > 0 && all(sign(sentiments) == -1)) 1 else 0
+  })
+  sentiment_results$mixed_sentiment <- sapply(sentiments_per_tweet, function(sentiments) {
+    if (length(sentiments) > 1 && any(sign(sentiments) == 1) && any(sign(sentiments) == -1)) 1 else 0
+  })
+  # Return only the calculated features (not the tweet text)
+  return(sentiment_results[, -1])
+}
+
+# Enhanced function for emotional features
+extract_emotions <- function(texts) {
+  # Get NRC emotions
+  emotions <- get_nrc_sentiment(texts)
+  
+  # Define expected emotion columns
+  emotion_cols <- c("anger", "anticipation", "disgust", "fear", 
+                    "joy", "sadness", "surprise", "trust", 
+                    "positive", "negative")
+  
+  # Add any missing columns with 0s
+  for (col in emotion_cols) {
+    if (!(col %in% colnames(emotions))) {
+      emotions[[col]] <- 0
+    }
+  }
+  
+  # Rename emotion columns to include _nrc suffix
+  rename_map <- setNames(paste0(emotion_cols, "_nrc"), emotion_cols)
+  names(emotions)[names(emotions) %in% names(rename_map)] <- rename_map[names(emotions)[names(emotions) %in% names(rename_map)]]
+  
+  # Calculate emotion ratios
+  emotions$neg_to_pos_ratio <- ifelse(emotions$positive_nrc > 0, 
+                                      emotions$negative_nrc / emotions$positive_nrc, 
+                                      emotions$negative_nrc)
+  
+  # Emotional complexity
+  basic_emotions <- paste0(c("anger", "anticipation", "disgust", "fear", 
+                             "joy", "sadness", "surprise", "trust"), "_nrc")
+  emotions$emotion_complexity <- apply(emotions[, basic_emotions], 1, function(row) {
+    sum(row > 0)
+  })
+  
+  # Dominant emotion
+  emotions$dominant_emotion <- apply(emotions[, basic_emotions], 1, function(row) {
+    if (all(row == 0)) return("none")
+    c("anger", "anticipation", "disgust", "fear", "joy", "sadness", "surprise", "trust")[which.max(row)]
+  })
+  
+  return(emotions)
+}
+
+# Function to calculate linguistic complexity features
+linguistic_complexity <- function(texts) {
+  # Initialize results data frame
+  results <- data.frame(
+    avg_word_length = numeric(length(texts)),
+    avg_sentence_length = numeric(length(texts)),
+    lexical_diversity = numeric(length(texts)),
+    question_marks = numeric(length(texts)),
+    exclamation_marks = numeric(length(texts)),
+    capitalized_ratio = numeric(length(texts))
+  )
+  
+  for (i in seq_along(texts)) {
+    text <- texts[i]
+    
+    # Words
+    words <- unlist(str_split(text, "\\s+"))
+    words <- words[words != ""]
+    
+    # Average word length
+    results$avg_word_length[i] <- mean(nchar(words), na.rm = TRUE)
+    
+    # Sentences
+    sentences <- get_sentences(text)
+    
+    # Average sentence length
+    results$avg_sentence_length[i] <- mean(sapply(sentences, function(s) {
+      length(unlist(str_split(s, "\\s+")))
+    }), na.rm = TRUE)
+    
+    # Lexical diversity (unique words / total words)
+    if (length(words) > 0) {
+      results$lexical_diversity[i] <- length(unique(words)) / length(words)
+    } else {
+      results$lexical_diversity[i] <- 0
+    }
+    
+    # Question marks
+    results$question_marks[i] <- str_count(text, "\\?")
+    
+    # Exclamation marks
+    results$exclamation_marks[i] <- str_count(text, "!")
+    
+    # Capitalization ratio
+    cap_chars <- sum(str_count(text, "[A-Z]"))
+    all_chars <- sum(str_count(text, "[a-zA-Z]"))
+    results$capitalized_ratio[i] <- ifelse(all_chars > 0, cap_chars / all_chars, 0)
+  }
+  
+  return(results)
+}
+
+# Comprehensive Feature Set Construction
+
+# Add basic word features
+train_grouped <- important_words(train_grouped)
+dev_grouped <- important_words(dev_grouped)
+
+# Add collocation features
+train_grouped <- coloc(train_grouped)
+dev_grouped <- coloc(dev_grouped)
+
+# Add textual statistics
+train_grouped$tweet_length <- nchar(train_grouped$tweet)
+train_grouped$word_count <- sapply(strsplit(train_grouped$tweet, "\\s+"), length)
+
+dev_grouped$tweet_length <- nchar(dev_grouped$tweet)
+dev_grouped$word_count <- sapply(strsplit(dev_grouped$tweet, "\\s+"), length)
+
+# Add linguistic complexity features
+train_ling <- linguistic_complexity(train_grouped$tweet)
+dev_ling <- linguistic_complexity(dev_grouped$tweet)
+
+train_grouped <- cbind(train_grouped, train_ling)
+dev_grouped <- cbind(dev_grouped, dev_ling)
+
+# Add sentiment sequence features
+train_sent <- sent_seq(train_grouped)
+dev_sent <- sent_seq(dev_grouped)
+
+train_grouped <- cbind(train_grouped, train_sent)
+dev_grouped <- cbind(dev_grouped, dev_sent)
+
+# Add emotion features
+train_emotions <- extract_emotions(train_grouped$tweet)
+dev_emotions <- extract_emotions(dev_grouped$tweet)
+
+train_grouped <- cbind(train_grouped, train_emotions)
+dev_grouped <- cbind(dev_grouped, dev_emotions)
+
+# Feature Analysis and Selection
+
+# Compare emotions between sexist and non-sexist tweets
+# Visualize emotion distribution by class
+emotion_means <- train_grouped %>%
+  group_by(final_label) %>%
+  summarise(across(c(anger_nrc, anticipation_nrc, disgust_nrc, fear_nrc, joy_nrc, sadness_nrc, surprise_nrc, trust_nrc, negative_nrc, positive_nrc), mean, na.rm = TRUE))
+
+# Reshaping the data for visualization
+emotion_data <- reshape2::melt(emotion_means, id.vars="final_label", 
+                               variable.name="emotion", value.name="mean_score")
+
+# Enhanced emotion visualization
+ggplot(emotion_data, aes(x = emotion, y = mean_score, fill = final_label)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = sexist_colors, name = "Class") +
+  labs(title = "Mean Emotion Scores by Class",
+       subtitle = "Emotions detected in sexist vs. non-sexist tweets",
+       x = "Emotion", y = "Mean Score") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Examine dominant emotions
+dominant_counts <- train_grouped %>%
+  group_by(final_label, dominant_emotion) %>%
+  summarise(count = n()) %>%
+  group_by(final_label) %>%
+  mutate(proportion = count / sum(count))
+
+# Visualize dominant emotions by class
+ggplot(dominant_counts, aes(x = dominant_emotion, y = proportion, fill = final_label)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = sexist_colors, name = "Class") +
+  labs(title = "Dominant Emotions by Class",
+       subtitle = "Proportion of tweets with each dominant emotion",
+       x = "Dominant Emotion", y = "Proportion") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Analyze linguistic complexity features by class
+ling_means <- train_grouped %>%
+  group_by(final_label) %>%
+  summarise(across(c(avg_word_length, avg_sentence_length, lexical_diversity,
+                     question_marks, exclamation_marks, capitalized_ratio), 
+                   mean, na.rm = TRUE))
+
+ling_data <- reshape2::melt(ling_means, id.vars="final_label", 
+                            variable.name="feature", value.name="mean_value")
+
+# Visualize linguistic complexity by class
+ggplot(ling_data, aes(x = feature, y = mean_value, fill = final_label)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = sexist_colors, name = "Class") +
+  labs(title = "Linguistic Complexity Features by Class",
+       subtitle = "Mean values of text complexity metrics",
+       x = "Feature", y = "Mean Value") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Calculate feature correlations with target
+model_features <- train_grouped %>%
+  dplyr::select(-tweet, -count_yes, -count_no, -annotator_count, -agreement_ratio)
+
+# Convert target to numeric
+model_features$target_numeric <- as.numeric(model_features$final_label == "yes")
+
+# Calculate point-biserial correlation for each feature with the target
+correlations <- sapply(select_if(model_features, is.numeric), function(x) {
+  if(var(x, na.rm = TRUE) > 0) {
+    cor(x, model_features$target_numeric, use = "pairwise.complete.obs")
+  } else {
+    0
+  }
+})
+
+# Filter out NAs
+correlations <- correlations[!is.na(correlations)]
+
+# Create a data frame for visualization
+cor_df <- data.frame(
+  feature = names(correlations),
+  correlation = as.numeric(correlations)
+) %>%
+  arrange(desc(abs(correlation)))
+
+# Visualize top correlated features
+ggplot(head(cor_df, 25), aes(x = reorder(feature, abs(correlation)), y = correlation, fill = correlation > 0)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = "#e74c3c", "FALSE" = "#3498db"), 
+                    labels = c("Positive correlation", "Negative correlation")) +
+  labs(title = "Features Most Correlated with Sexism",
+       subtitle = "Point-biserial correlation between features and target",
+       x = "Feature", y = "Correlation Coefficient", fill = "Direction") +
+  theme(legend.position = "bottom")
+
+head(cor_df, 50)
+
+# Feature Selection
+
+# Select features for modeling based on analysis
+features <- c(
+  # === Palavra-chave sobre gênero ou insultos ===
+  "woman", "women", "men", "girl", "sex", "bitch", "fuck",
+  "love", "joke", "victim", "harass", "equal", "feminist",
+  
+  # === Expressões específicas ou collocations ===
+  "sexist_colloc_count", "non_sexist_colloc_count",
+  "yes_dumb_blond", "yes_short_skirt", "yes_cock_carousel",
+  "yes_gold_digger", "no_gold_digger", "yes_blah_blah", 
+  "no_victim_card", "no_knee_slapper", "no_virginia_woolf",
+  "yes_everyday_sexism", "no_everyday_sexism",
+  "yes_cock_teas", "no_cock_teas", "no_mental_ill",
+  "no_sexual_orient", "no_voter_suppress",
+  
+  # === Sentimento geral e complexidade emocional ===
+  "overall_sentiment", "all_pos", "all_neg", "mixed_sentiment",
+  "neg_to_pos_ratio", "emotion_complexity", "sentiment_range",
+  
+  # === Emoções específicas (NRC lexicon) ===
+  "disgust_nrc", "sadness_nrc", "negative_nrc", "positive_nrc", 
+  "trust_nrc", "anger_nrc", "fear_nrc", "joy_nrc",
+  
+  # === Complexidade linguística ===
+  "avg_word_length", "question_marks", "capitalized_ratio", 
+  "tweet_length", "word_count"
+)
+
+
+
+# Create modeling dataset
+modeling_data <- train_grouped %>%
+  dplyr::select(tweet, final_label, all_of(features)) %>%
+  rename(sexist = final_label) %>%
+  mutate(across(where(is.numeric), ~ifelse(is.na(.) | is.nan(.) | is.infinite(.), 0, .)))
+
+# Same features for dev data
+dev_modeling <- dev_grouped %>%
+  dplyr::select(tweet, final_label, all_of(features)) %>%
+  rename(sexist = final_label) %>%
+  mutate(across(where(is.numeric), ~ifelse(is.na(.) | is.nan(.) | is.infinite(.), 0, .)))
+
+# Handle Class Imbalance with SMOTE
+
+# Prepare data for SMOTE
+set.seed(123)
+smote_data <- modeling_data %>% dplyr::select(-tweet)
+
+# Apply SMOTE to balance classes
+smote_recipe <- recipe(sexist ~ ., data = smote_data) %>%
+  step_smote(sexist)
+smote_prep <- prep(smote_recipe)
+train_data_balanced <- bake(smote_prep, new_data = NULL)
+
+# Check balanced distribution
+balanced_distribution <- train_data_balanced %>%
+  count(sexist) %>%
+  mutate(prop = n / sum(n))
+
+print("Balanced Class Distribution after SMOTE:")
+print(balanced_distribution)
+
+# Visualize the balanced distribution
+ggplot(balanced_distribution, aes(x = sexist, fill = sexist)) +
+  geom_bar() +
+  labs(title = "Class Distribution after SMOTE", 
+       x = "Sexist Label", 
+       y = "Count") +
+  theme_minimal()
+
+
+# Prepare final training and dev datasets
+
+# Prepare features and target for training
+X_train_final <- train_data_balanced %>% dplyr::select(-sexist)
+y_train_final <- train_data_balanced$sexist
+
+# Prepare features and target for dev set
+X_dev <- dev_modeling %>% 
+  dplyr::select(all_of(features)) %>%
+  mutate(across(everything(), ~ ifelse(is.na(.), 0, .))) # Replace NA values with 0
+y_dev <- as.factor(dev_modeling$sexist)
+
+# Convert to data frames
+X_train_df <- as.data.frame(X_train_final)
+# Ensure consistent factor levels across all datasets
+y_train_final <- factor(y_train_final, levels = c("no", "yes"))  
+
+X_dev_df <- as.data.frame(X_dev)
+y_dev <- factor(y_dev, levels = c("no", "yes"))
+
+# Scale features - using training set parameters for dev set to prevent data leakage
+X_train_scaled <- scale(X_train_df)
+X_dev_scaled <- scale(X_dev_df, 
+                      center = attr(X_train_scaled, "scaled:center"), 
+                      scale = attr(X_train_scaled, "scaled:scale"))
+
+# Convert to dataframes for model training
+X_dev_scaled_df <- as.data.frame(X_dev_scaled)
+X_train_scaled_df <- as.data.frame(X_train_scaled)
+# Combine predictors and response for training
+train_data_combined <- cbind(X_train_scaled_df, sexist = y_train_final)
+
+# Set up for parallel processing to speed up cross-validation
+num_cores <- detectCores() - 1  # Leave one core free
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+y_train_final <- factor(y_train_final, levels = c("no", "yes"))
+y_dev <- factor(y_dev, levels = c("no", "yes"))
+
+# -------------------------------------------------------------------------------------------------------------------
+# Model Training and Evaluation
+# -------------------------------------------------------------------------------------------------------------------
+# Cross-Validation Setup
+# Define cross-validation control
+cv_control <- trainControl(
+  method = "cv",
+  number = 5,  # 5-fold cross-validation
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,  # For binary classification metrics
+  savePredictions = "final",
+  verboseIter = TRUE,
+  allowParallel = TRUE
+)
+
+# Create list to store all ROC objects and prediction results
+roc_list <- list()
+prediction_list <- list()
+cv_results_list <- list()
+
+# Function to evaluate model performance on the dev set
+evaluate_model <- function(model, X_dev, y_dev, model_name, prob_method = "prob") {
+  if (prob_method == "prob") {
+    # For models that use predict(..., type="prob")
+    pred_probs <- predict(model, X_dev, type = "prob")
+    pred_prob <- pred_probs[, "yes"]
+  } else if (prob_method == "response") {
+    # For models like glmnet that use predict(..., type="response")
+    pred_prob <- predict(model, X_dev, type = "response")
+  } 
+  # Calculate binary predictions using 0.5 threshold
+  pred_class <- ifelse(pred_prob > 0.5, "yes", "no") %>% factor(levels = c("no", "yes"))
+  
+  # Ensure y_dev is a factor with the same levels
+  y_dev_factor <- factor(y_dev, levels = c("no", "yes"))
+  
+  # Calculate performance metrics
+  conf_mat <- confusionMatrix(pred_class, y_dev_factor, mode = "everything")
+  roc_obj <- roc(as.numeric(y_dev_factor == "yes"), pred_prob)
+  auc_val <- auc(roc_obj)
+  
+  # Helper function to safely get a metric for a class
+  safe_get_metric <- function(cm_by_class, metric, class_name) {
+    if (class_name %in% colnames(cm_by_class)) {
+      return(cm_by_class[metric, class_name])
+    } else {
+      return(NA)
+    }
+  }
+  
+  # Extract per-class metrics safely
+  # Extract metrics for positive and negative classes (binary case)
+  recall_yes     <- conf_mat$byClass["Sensitivity"]        # Recall for "yes"
+  recall_no      <- conf_mat$byClass["Specificity"]        # Recall for "no"
+  precision_yes  <- conf_mat$byClass["Pos Pred Value"]     # Precision for "yes"
+  precision_no   <- conf_mat$byClass["Neg Pred Value"]     # Precision for "no"
+  f1_yes         <- conf_mat$byClass["F1"]
+  # No direct F1 for "no" — you could compute it manually if needed
+  
+  # Optional: manually compute F1 for "no"
+  precision_neg <- conf_mat$byClass["Neg Pred Value"]
+  recall_neg <- conf_mat$byClass["Specificity"]
+  f1_no <- if (!is.na(precision_neg) && !is.na(recall_neg) &&
+               (precision_neg + recall_neg) > 0) {
+    2 * precision_neg * recall_neg / (precision_neg + recall_neg)
+  } else {
+    NA
+  }
+  
+  # Calculate macro-averaged metrics
+  recall_macro <- mean(c(recall_yes, recall_no), na.rm = TRUE)
+  precision_macro <- mean(c(precision_yes, precision_no), na.rm = TRUE)
+  f1_macro <- mean(c(f1_yes, f1_no), na.rm = TRUE)
+  
+  # Store results
+  roc_list[[model_name]] <<- roc_obj
+  prediction_list[[model_name]] <<- list(
+    pred_prob = pred_prob,
+    pred_class = pred_class,
+    conf_mat = conf_mat,
+    auc = auc_val,
+    recall_macro = recall_macro,
+    precision_macro = precision_macro,
+    f1_macro = f1_macro
+  )
+  
+  # Print results
+  cat("\n", model_name, "Results:\n")
+  print(conf_mat)
+  cat("AUC:", auc_val, "\n")
+  cat("Recall (Macro):", recall_macro, "\n")
+  cat("Precision (Macro):", precision_macro, "\n")
+  cat("F1 (Macro):", f1_macro, "\n")
+  
+  return(list(
+    conf_mat = conf_mat,
+    auc = auc_val,
+    recall_macro = recall_macro,
+    precision_macro = precision_macro,
+    f1_macro = f1_macro
+  ))
+}
+
+# -----------------------------------------------------------------------------
+# MODEL 1: Logistic Regression with CV Tuning
+# -----------------------------------------------------------------------------
+cat("\nTraining Logistic Regression model with cross-validation...\n")
+
+# Set up grid for alpha (elastic net mixing parameter) and lambda (regularization strength)
+glmnet_grid <- expand.grid(
+  alpha = c(1),  # 0 = ridge, 1 = lasso, between = elastic net
+  lambda = 0.002154435 
+)
+
+# Train model with caret for cross-validation
+lr_cv_model <- train(
+  x = as.matrix(X_train_scaled_df),
+  y = y_train_final,
+  method = "glmnet",
+  trControl = cv_control,
+  tuneGrid = glmnet_grid,
+  metric = "ROC"
+)
+
+# Extract best model parameters
+lr_best_alpha <- lr_cv_model$bestTune$alpha
+lr_best_lambda <- lr_cv_model$bestTune$lambda
+
+
+cat("\nLogistic Regression Best Parameters:\n")
+cat("Alpha:", lr_best_alpha, "\n")
+cat("Lambda:", lr_best_lambda, "\n")
+
+# Evaluate on dev set
+lr_results <- evaluate_model(
+  lr_cv_model, 
+  X_dev_scaled_df, 
+  y_dev, 
+  "Logistic Regression", 
+  prob_method = "prob"
+)
+
+conf_mat_lr <- lr_results$conf_mat
+auc_lr <- lr_results$auc
+
+# Store cross-validation results
+cv_results_list[["Logistic Regression"]] <- lr_cv_model$results
+
+# -----------------------------------------------------------------------------
+# MODEL 2: Support Vector Machine with CV Tuning
+# -----------------------------------------------------------------------------
+cat("\nTraining SVM model with cross-validation...\n")
+
+# Set up grid for SVM parameters
+svm_grid <- expand.grid(
+  sigma = 0.00390625,
+  C = 26.90869 
+)
+
+# Train model with caret for cross-validation
+svm_cv_model <- train(
+  x = X_train_scaled_df,
+  y = y_train_final,
+  method = "svmRadial",
+  trControl = cv_control,
+  tuneGrid = svm_grid,
+  metric = "ROC",
+  preProcess = NULL  # Already scaled
+)
+
+# Extract best model parameters
+svm_best_sigma <- svm_cv_model$bestTune$sigma
+svm_best_C <- svm_cv_model$bestTune$C
+
+
+cat("\nSVM Best Parameters:\n")
+cat("Sigma:", svm_best_sigma, "\n")
+cat("C:", svm_best_C, "\n")
+
+# Evaluate on dev set
+svm_results <- evaluate_model(
+  svm_cv_model, 
+  X_dev_scaled_df, 
+  y_dev, 
+  "SVM", 
+  prob_method = "prob"
+)
+
+conf_mat_svm <- svm_results$conf_mat
+auc_svm <- svm_results$auc
+
+# Store cross-validation results
+cv_results_list[["SVM"]] <- svm_cv_model$results
+
+# -----------------------------------------------------------------------------
+# MODEL 3: Decision Tree with CV Tuning
+# -----------------------------------------------------------------------------
+cat("\nTraining Decision Tree model with cross-validation...\n")
+
+# Set up grid for decision tree parameters
+rpart_grid <- expand.grid(
+  cp = 0.001  # complexity parameter
+)
+
+# Train model with caret for cross-validation
+dt_cv_model <- train(
+  x = X_train_scaled_df,
+  y = y_train_final,
+  method = "rpart",
+  trControl = cv_control,
+  tuneGrid = rpart_grid,
+  metric = "ROC"
+)
+
+# Extract best model parameters
+dt_best_cp <- dt_cv_model$bestTune$cp
+
+cat("\nDecision Tree Best Parameters:\n")
+cat("Complexity Parameter:", dt_best_cp, "\n")
+
+# Evaluate on dev set
+dt_results <- evaluate_model(
+  dt_cv_model, 
+  X_dev_scaled_df, 
+  y_dev, 
+  "Decision Tree", 
+  prob_method = "prob"
+)
+
+conf_mat_dt <- dt_results$conf_mat
+auc_dt <- dt_results$auc
+
+# Store cross-validation results
+cv_results_list[["Decision Tree"]] <- dt_cv_model$results
+
+# Plot the decision tree
+best_tree <- dt_cv_model$finalModel
+rpart.plot(best_tree, box.palette = "RdBu", shadow.col = "gray", nn = TRUE)
+
+
+# -----------------------------------------------------------------------------
+# MODEL 4: Random Forest with CV Tuning
+# -----------------------------------------------------------------------------
+cat("\nTraining Random Forest model with cross-validation...\n")
+
+# Set up grid for random forest parameters
+rf_grid <- expand.grid(
+  mtry = seq(8)
+)
+
+# Train model with caret for cross-validation
+rf_cv_model <- train(
+  x = X_train_scaled_df,
+  y = y_train_final,
+  method = "rf",
+  trControl = cv_control,
+  tuneGrid = rf_grid,
+  metric = "ROC",
+  importance = TRUE,
+  ntree = 300
+)
+
+# Extract best model parameters
+rf_best_mtry <- rf_cv_model$bestTune$mtry
+
+cat("\nRandom Forest Best Parameters:\n")
+cat("mtry:", rf_best_mtry, "\n")
+
+# Evaluate on dev set
+rf_results <- evaluate_model(
+  rf_cv_model, 
+  X_dev_scaled_df, 
+  y_dev, 
+  "Random Forest", 
+  prob_method = "prob"
+)
+
+conf_mat_rf <- rf_results$conf_mat
+auc_rf <- rf_results$auc
+
+# Store cross-validation results
+cv_results_list[["Random Forest"]] <- rf_cv_model$results
+
+# -----------------------------------------------------------------------------
+# MODEL 5: Gradient Boosting Machine with CV Tuning
+# -----------------------------------------------------------------------------
+cat("\nTraining GBM model with cross-validation...\n")
+set.seed(123)
+# Number of folds and grid size
+num_folds <- 5
+grid_size <- 48  
+
+# Set seeds list for reproducibility
+seeds_list <- vector("list", length = num_folds + 1)
+for (i in 1:num_folds) {
+  seeds_list[[i]] <- sample.int(1e6, grid_size)
+}
+seeds_list[[num_folds + 1]] <- sample.int(1e6, 1)  # For final model
+
+# Plug into trainControl
+cv_control <- trainControl(
+  method = "cv",
+  number = num_folds,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final",
+  verboseIter = TRUE,
+  allowParallel = TRUE,
+  seeds = seeds_list
+)
+# Set up grid for GBM parameters
+gbm_grid <- expand.grid(
+  n.trees = c(300),            # number of boosting iterations
+  interaction.depth = c(7),          # max tree depth (complexity)
+  shrinkage = c(0.05),     # learning rate (smaller = slower learning)
+  n.minobsinnode = c(10)               # minimum samples per terminal node
+)
+
+# Train model with caret for cross-validation
+gbm_cv_model <- train(
+  x = X_train_scaled_df,
+  y = y_train_final,
+  method = "gbm",
+  trControl = cv_control,
+  tuneGrid = gbm_grid,
+  metric = "ROC",
+  verbose = FALSE
+)
+
+# Extract best model parameters
+gbm_best_params <- gbm_cv_model$bestTune
+
+cat("\nGBM Best Parameters:\n")
+print(gbm_best_params)
+# Predictions on dev set
+probs_gbm <- predict(gbm_cv_model, newdata = X_dev_scaled_df, type = "prob")[, 2]
+preds_gbm <- ifelse(probs_gbm > 0.5, levels(y_dev)[2], levels(y_dev)[1])
+preds_gbm <- factor(preds_gbm, levels = levels(y_dev))
+
+# Confusion matrix
+conf_mat_gbm <- caret::confusionMatrix(preds_gbm, y_dev, positive = levels(y_dev)[2])
+
+# ROC and AUC
+roc_gbm <- pROC::roc(response = y_dev, predictor = probs_gbm)
+auc_gbm <- pROC::auc(roc_gbm)
+
+# Output AUC to console
+cat("\nGBM AUC:\n")
+print(auc_gbm)
+
+# Store cross-validation results
+cv_results_list[["GBM"]] <- gbm_cv_model$results
+results_gbm <- evaluate_model(gbm_cv_model, X_dev_scaled_df, y_dev, "GBM", prob_method = "prob")
+
+# Model Comparison
+results_lr <- evaluate_model(lr_cv_model, X_dev_scaled_df, y_dev, "Logistic Regression", prob_method = "prob")
+results_svm <- evaluate_model(svm_cv_model, X_dev_scaled_df, y_dev, "SVM", prob_method = "prob")
+results_dt <- evaluate_model(dt_cv_model, X_dev_scaled_df, y_dev, "Decision Tree", prob_method = "prob")
+results_rf <- evaluate_model(rf_cv_model, X_dev_scaled_df, y_dev, "Random Forest", prob_method = "prob")
+results_gbm <- evaluate_model(gbm_cv_model, X_dev_scaled_df, y_dev, "GBM", prob_method = "prob")
+
+# Create comprehensive model comparison dataframe
+model_comparison <- data.frame(
+  Model = c("Logistic Regression", "SVM", "Decision Tree", "Random Forest",
+             "GBM"),
+  Accuracy = c(results_lr$conf_mat$overall["Accuracy"],
+               results_svm$conf_mat$overall["Accuracy"],
+               results_dt$conf_mat$overall["Accuracy"],
+               results_rf$conf_mat$overall["Accuracy"],
+               results_gbm$conf_mat$overall["Accuracy"]),
+  Precision_Macro = c(results_lr$precision_macro,
+                      results_svm$precision_macro,
+                      results_dt$precision_macro,
+                      results_rf$precision_macro,
+                      results_gbm$precision_macro),
+  Recall_Macro = c(results_lr$recall_macro,
+                   results_svm$recall_macro,
+                   results_dt$recall_macro,
+                   results_rf$recall_macro,
+                   results_gbm$recall_macro),
+  F1_Macro = c(results_lr$f1_macro,
+               results_svm$f1_macro,
+               results_dt$f1_macro,
+               results_rf$f1_macro,
+               results_gbm$f1_macro),
+  AUC = c(results_lr$auc, results_svm$auc, results_dt$auc, results_rf$auc, results_gbm$auc)
+)
+
+print("Final Model Comparison:")
+print(model_comparison)
+
+# --- Task 2 ---
+train_data_annotators <- train_data
+dev_data_annotators <- dev_data
+
+train_data_annotators$sexist_numeric_label <- ifelse(train_data_annotators$sexist == "yes", 1, 0)
+
+# Calculate and Print Sexism Labeling Rates by Demographic (using 'train_data_annotators')
+
+# By Gender
+task2_rate_gender <- train_data_annotators %>%
+  filter(!is.na(gender)) %>%
+  group_by(gender) %>%
+  summarise(
+    total_annotations = n(),
+    sexism_labeling_rate = mean(sexist_numeric_label, na.rm = TRUE)
+  ) %>%
+  arrange(desc(sexism_labeling_rate))
+
+print("Task 2: Sexism Labeling Rate by Annotator Gender")
+print(task2_rate_gender)
+
+# By Age Group 
+task2_rate_age <- train_data_annotators %>%
+  filter(!is.na(age)) %>% 
+  group_by(age) %>%      
+  summarise(
+    total_annotations = n(),
+    sexism_labeling_rate = mean(sexist_numeric_label, na.rm = TRUE)
+  ) %>%
+  arrange(age) 
+
+print("Task 2: Sexism Labeling Rate by Annotator Age Group")
+print(task2_rate_age)
+
+# By Country
+task2_rate_country <- train_data_annotators %>%
+  filter(!is.na(country)) %>%
+  group_by(country) %>%
+  summarise(
+    total_annotations = n(),
+    sexism_labeling_rate = mean(sexist_numeric_label, na.rm = TRUE)
+  ) %>%
+  filter(total_annotations >= 20) %>%
+  arrange(desc(sexism_labeling_rate))
+
+print("Task 2: Sexism Labeling Rate by Annotator Country (>=20 annotations)")
+print(task2_rate_country)
+
+# By Education
+task2_rate_education <- train_data_annotators %>%
+  filter(!is.na(education)) %>%
+  group_by(education) %>%
+  summarise(
+    total_annotations = n(),
+    sexism_labeling_rate = mean(sexist_numeric_label, na.rm = TRUE)
+  ) %>%
+  arrange(desc(sexism_labeling_rate))
+
+print("Task 2: Sexism Labeling Rate by Annotator Education")
+print(task2_rate_education)
+
+# By Ethnicity
+task2_rate_ethnicity <- train_data_annotators %>%
+  filter(!is.na(ethnicity)) %>%
+  group_by(ethnicity) %>%
+  summarise(
+    total_annotations = n(),
+    sexism_labeling_rate = mean(sexist_numeric_label, na.rm = TRUE)
+  ) %>%
+  filter(total_annotations >= 10) %>%
+  arrange(desc(sexism_labeling_rate))
+
+print("Task 2: Sexism Labeling Rate by Annotator Ethnicity (>=10 annotations)")
+print(task2_rate_ethnicity)
+
+# Visualize Labeling Rates 
+
+ggplot(task2_rate_gender, aes(x = reorder(gender, -sexism_labeling_rate), y = sexism_labeling_rate, fill = gender)) +
+  geom_col() +
+  geom_text(aes(label = percent(sexism_labeling_rate, accuracy = 0.1)), vjust = -0.5) +
+  labs(title = "Task 2: Sexism Labeling Rate by Annotator Gender", x = "Gender", y = "Sexism Labeling Rate") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggplot(task2_rate_age, aes(x = age, y = sexism_labeling_rate, fill = age)) +
+  geom_col() +
+  geom_text(aes(label = percent(sexism_labeling_rate, accuracy = 0.1)), vjust = -0.5) +
+  labs(title = "Task 2: Sexism Labeling Rate by Annotator Age Group", x = "Age Group", y = "Sexism Labeling Rate") +
+  theme(legend.position = "none")
+
+ggplot(task2_rate_country, aes(x = reorder(country, -sexism_labeling_rate), y = sexism_labeling_rate, fill = country)) +
+  geom_col() +
+  geom_text(aes(label = percent(sexism_labeling_rate, accuracy = 0.1)), vjust = -0.5, size = 3) +
+  labs(title = "Task 2: Sexism Labeling Rate by Annotator Country", x = "Country", y = "Sexism Labeling Rate") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 60, hjust = 1))
+
+ggplot(task2_rate_education, aes(x = reorder(education, -sexism_labeling_rate), y = sexism_labeling_rate, fill = education)) +
+  geom_col() +
+  geom_text(aes(label = percent(sexism_labeling_rate, accuracy = 0.1)), vjust = -0.5, size = 3) +
+  labs(title = "Task 2: Sexism Labeling Rate by Annotator Education", x = "Education Level", y = "Sexism Labeling Rate") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggplot(task2_rate_ethnicity, aes(x = reorder(ethnicity, -sexism_labeling_rate), y = sexism_labeling_rate, fill = ethnicity)) +
+  geom_col() +
+  geom_text(aes(label = percent(sexism_labeling_rate, accuracy = 0.1)), vjust = -0.5, size = 3) +
+  labs(title = "Task 2: Sexism Labeling Rate by Annotator Ethnicity", x = "Ethnicity", y = "Sexism Labeling Rate") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Statistical Significance Testing (Chi-squared test)
+
+perform_chisq_test_no_if <- function(input_data, demographic_col_name_str, label_col_name_str) {
+  contingency_table_data <- input_data %>%
+    filter(!is.na(.data[[demographic_col_name_str]]) & !is.na(.data[[label_col_name_str]])) %>%
+    count(.data[[demographic_col_name_str]], .data[[label_col_name_str]]) %>%
+    pivot_wider(names_from = all_of(label_col_name_str), values_from = n, values_fill = list(n = 0))
+  
+  print(paste("Contingency Table for", demographic_col_name_str, "vs.", label_col_name_str, ":"))
+  print(contingency_table_data)
+  
+  demographic_levels_vector <- contingency_table_data[[demographic_col_name_str]]
+  matrix_cols <- setdiff(names(contingency_table_data), demographic_col_name_str)
+  
+  test_matrix_data <- as.matrix(contingency_table_data[, matrix_cols])
+  
+  execute_rownames_assignment <- try(rownames(test_matrix_data) <- demographic_levels_vector, silent = TRUE)
+  
+  chi_squared_test_result <- try(chisq.test(test_matrix_data), silent = TRUE)
+  
+  print(paste("Chi-squared Test Result for", demographic_col_name_str, "and", label_col_name_str, ":"))
+  print(chi_squared_test_result)
+}
+
+# Perform tests using 'train_data_annotators$sexist' ("yes"/"no") column
+perform_chisq_test_no_if(train_data_annotators, "gender", "sexist")
+
+
+# Perform tests using 'train_data_annotators$sexist' ("yes"/"no") column
+perform_chisq_test_no_if(train_data_annotators, "gender", "sexist")
+perform_chisq_test_no_if(train_data_annotators, "age", "sexist") 
+perform_chisq_test_no_if(train_data_annotators, "country", "sexist")
+perform_chisq_test_no_if(train_data_annotators, "education", "sexist")
+perform_chisq_test_no_if(train_data_annotators, "ethnicity", "sexist")
+
+# --- Task 2: Feature Engineering ---
+# Feature 1: Proportion of annotators for each tweet from the "18-22" age group
+
+annotator_age_features <- train_data_annotators %>%
+  filter(!is.na(tweet) & !is.na(age)) %>%
+  group_by(tweet) %>%
+  summarise(
+    total_annotators_tweet = n(),
+    count_age_18_22 = sum(age == "18-22", na.rm = TRUE),
+    prop_age_18_22 = ifelse(total_annotators_tweet > 0, count_age_18_22 / total_annotators_tweet, 0),
+    .groups = 'drop'
+  ) %>%
+  dplyr::select(tweet, prop_age_18_22)
+
+# Merge into train_grouped
+train_grouped <- left_join(train_grouped, annotator_age_features, by = "tweet")
+
+# Feature 2: Proportion of annotators with 'Doctorate' education for each tweet
+
+annotator_edu_features <- train_data_annotators %>%
+  filter(!is.na(tweet) & !is.na(education)) %>%
+  group_by(tweet) %>%
+  summarise(
+    total_annotators_tweet_edu = n(), # Recalculate or use existing count if available
+    count_annotators_doctorate = sum(education == "Doctorate", na.rm = TRUE),
+    prop_doctorate = ifelse(total_annotators_tweet_edu > 0, count_annotators_doctorate / total_annotators_tweet_edu, 0),
+    .groups = 'drop'
+  ) %>%
+  dplyr::select(tweet, prop_doctorate)
+
+train_grouped <- left_join(train_grouped, annotator_edu_features, by = "tweet")
+
+# Feature 3: Binary flag if any annotator for the tweet was from 'Middle Eastern' ethnicity
+
+annotator_ethnicity_features <- train_data_annotators %>%
+  filter(!is.na(tweet) & !is.na(ethnicity)) %>%
+  group_by(tweet) %>%
+  summarise(
+    middle_eastern = as.integer(any(ethnicity == "Middle Eastern", na.rm = TRUE))
+  )
+
+train_grouped <- left_join(train_grouped, annotator_ethnicity_features, by = "tweet")
+
+# Feature 4: Proportion of annotators from a country with a high sexism labeling rate
+
+annotator_country_features <- train_data_annotators %>%
+  filter(!is.na(tweet) & !is.na(country)) %>%
+  group_by(tweet) %>%
+  summarise(
+    total_annotators_tweet_country = n(),
+    count_annotators_algeria = sum(country == "Algeria", na.rm = TRUE),
+    prop_algeria = ifelse(total_annotators_tweet_country > 0, count_annotators_algeria / total_annotators_tweet_country, 0),
+    .groups = 'drop'
+  ) %>%
+  dplyr::select(tweet, prop_algeria)
+
+train_grouped <- left_join(train_grouped, annotator_country_features, by = "tweet")
+# --- Task 2: Feature Engineering (dev)---
+
+# Feature 1 (Dev): Proportion of annotators for each tweet from the "18-22" age group
+# Uses 'age_group' column from dev_data_annotators
+annotator_age_features_dev <- dev_data_annotators %>%
+  filter(!is.na(tweet) & !is.na(age_group)) %>%
+  group_by(tweet) %>%
+  summarise(
+    total_annotators_tweet_dev = n(),
+    count_age_18_22_dev = sum(age_group == "18-22", na.rm = TRUE),
+    # Calculate proportion, handle division by zero if total_annotators is 0 for a tweet
+    prop_age_18_22_dev = ifelse(total_annotators_tweet_dev > 0, count_age_18_22_dev / total_annotators_tweet_dev, 0),
+    .groups = 'drop' 
+  ) %>%
+  dplyr::select(tweet, prop_age_18_22_dev)
+
+# Merge into dev_grouped
+dev_grouped <- left_join(dev_grouped, annotator_age_features_dev, by = "tweet")
+
+# Feature 2 (Dev): Proportion of annotators with 'Doctorate' education for each tweet
+# Uses 'study_level' column from dev_data_annotators
+annotator_edu_features_dev <- dev_data_annotators %>%
+  filter(!is.na(tweet) & !is.na(study_level)) %>%
+  group_by(tweet) %>%
+  summarise(
+    total_annotators_tweet_edu_dev = n(),
+    count_annotators_doctorate_dev = sum(study_level == "Doctorate", na.rm = TRUE),
+    prop_doctorate_dev = ifelse(total_annotators_tweet_edu_dev > 0, count_annotators_doctorate_dev / total_annotators_tweet_edu_dev, 0),
+    .groups = 'drop'
+  ) %>%
+  dplyr::select(tweet, prop_doctorate_dev)
+
+dev_grouped <- left_join(dev_grouped, annotator_edu_features_dev, by = "tweet")
+
+# Feature 3 (Dev): Binary flag if any annotator for the tweet was from 'Middle Eastern' ethnicity
+# Uses 'ethnicity' column from dev_data_annotators
+annotator_ethnicity_features_dev <- dev_data_annotators %>%
+  filter(!is.na(tweet) & !is.na(ethnicity)) %>%
+  group_by(tweet) %>%
+  summarise(
+    middle_eastern_dev = as.integer(any(ethnicity == "Middle Eastern", na.rm = TRUE)),
+    .groups = 'drop'
+  )
+
+dev_grouped <- left_join(dev_grouped, annotator_ethnicity_features_dev, by = "tweet")
+
+# Feature 4 (Dev): Proportion of annotators from 'Algeria'
+# Uses 'country' column from dev_data_annotators
+annotator_country_features_dev <- dev_data_annotators %>%
+  filter(!is.na(tweet) & !is.na(country)) %>%
+  group_by(tweet) %>%
+  summarise(
+    total_annotators_tweet_country_dev = n(),
+    count_annotators_algeria_dev = sum(country == "Algeria", na.rm = TRUE),
+    prop_algeria_dev = ifelse(total_annotators_tweet_country_dev > 0, count_annotators_algeria_dev / total_annotators_tweet_country_dev, 0),
+    .groups = 'drop'
+  ) %>%
+  dplyr::select(tweet, prop_algeria_dev)
+
+dev_grouped <- left_join(dev_grouped, annotator_country_features_dev, by = "tweet")
+dev_grouped <- dev_grouped %>%
+  rename(
+    prop_age_18_22 = prop_age_18_22_dev,
+    prop_doctorate = prop_doctorate_dev,
+    middle_eastern = middle_eastern_dev,
+    prop_algeria = prop_algeria_dev
+  )
+# Select features for modeling based on analysis
+features <- c(
+  # === Palavra-chave sobre gênero ou insultos ===
+  "woman", "women", "men", "girl", "sex", "bitch", "fuck",
+  "love", "joke", "victim", "harass", "equal", "feminist",
+  
+  # === Expressões específicas ou collocations ===
+  "sexist_colloc_count", "non_sexist_colloc_count",
+  "yes_dumb_blond", "yes_short_skirt", "yes_cock_carousel",
+  "yes_gold_digger", "no_gold_digger", "yes_blah_blah", 
+  "no_victim_card", "no_knee_slapper", "no_virginia_woolf",
+  "yes_everyday_sexism", "no_everyday_sexism",
+  "yes_cock_teas", "no_cock_teas", "no_mental_ill",
+  "no_sexual_orient", "no_voter_suppress",
+  
+  # === Sentimento geral e complexidade emocional ===
+  "overall_sentiment", "all_pos", "all_neg", "mixed_sentiment",
+  "neg_to_pos_ratio", "emotion_complexity", "sentiment_range",
+  
+  # === Emoções específicas (NRC lexicon) ===
+  "disgust_nrc", "sadness_nrc", "negative_nrc", "positive_nrc", 
+  "trust_nrc", "anger_nrc", "fear_nrc", "joy_nrc",
+  
+  # === Complexidade linguística ===
+  "avg_word_length", "question_marks", "capitalized_ratio", 
+  "tweet_length", "word_count",
+  "middle_eastern"
+)
+
+# Create modeling dataset
+modeling_data <- train_grouped %>%
+  dplyr::select(tweet, final_label, all_of(features)) %>%
+  rename(sexist = final_label) %>%
+  mutate(across(where(is.numeric), ~ifelse(is.na(.) | is.nan(.) | is.infinite(.), 0, .)))
+
+# Same features for dev data
+dev_modeling <- dev_grouped %>%
+  dplyr::select(tweet, final_label, all_of(features)) %>%
+  rename(sexist = final_label) %>%
+  mutate(across(where(is.numeric), ~ifelse(is.na(.) | is.nan(.) | is.infinite(.), 0, .)))
+
+# Handle Class Imbalance with SMOTE
+
+# Prepare data for SMOTE
+# Handle Class Imbalance with SMOTE
+
+# Prepare data for SMOTE
+set.seed(123)
+smote_data <- modeling_data %>% dplyr::select(-tweet)
+
+# Apply SMOTE to balance classes
+smote_recipe <- recipe(sexist ~ ., data = smote_data) %>%
+  step_smote(sexist)
+smote_prep <- prep(smote_recipe)
+train_data_balanced <- bake(smote_prep, new_data = NULL)
+
+# Check balanced distribution
+balanced_distribution <- train_data_balanced %>%
+  count(sexist) %>%
+  mutate(prop = n / sum(n))
+
+print("Balanced Class Distribution after SMOTE:")
+print(balanced_distribution)
+
+
+# Prepare final training and dev datasets
+
+# Prepare features and target for training
+X_train_final <- train_data_balanced %>% dplyr::select(-sexist)
+y_train_final <- train_data_balanced$sexist
+
+# Prepare features and target for dev set
+X_dev <- dev_modeling %>% 
+  dplyr::select(all_of(features)) %>%
+  mutate(across(everything(), ~ ifelse(is.na(.), 0, .))) # Replace NA values with 0
+y_dev <- as.factor(dev_modeling$sexist)
+
+# Convert to data frames
+X_train_df <- as.data.frame(X_train_final)
+# Ensure consistent factor levels across all datasets
+y_train_final <- factor(y_train_final, levels = c("no", "yes"))  
+
+X_dev_df <- as.data.frame(X_dev)
+y_dev <- factor(y_dev, levels = c("no", "yes"))
+
+# Scale features - using training set parameters for dev set to prevent data leakage
+X_train_scaled <- scale(X_train_df)
+X_dev_scaled <- scale(X_dev_df, 
+                      center = attr(X_train_scaled, "scaled:center"), 
+                      scale = attr(X_train_scaled, "scaled:scale"))
+
+# Convert to dataframes for model training
+X_dev_scaled_df <- as.data.frame(X_dev_scaled)
+X_train_scaled_df <- as.data.frame(X_train_scaled)
+
+y_train_final <- factor(y_train_final, levels = c("no", "yes"))
+y_dev <- factor(y_dev, levels = c("no", "yes"))
+
+# MODEL 5: Gradient Boosting Machine with CV Tuning
+# -----------------------------------------------------------------------------
+cat("\nTraining GBM model with cross-validation...\n")
+set.seed(123)
+# Number of folds and grid size
+num_folds <- 5
+grid_size <- 48 
+
+# Set seeds list for reproducibility
+seeds_list <- vector("list", length = num_folds + 1)
+for (i in 1:num_folds) {
+  seeds_list[[i]] <- sample.int(1e6, grid_size)
+}
+seeds_list[[num_folds + 1]] <- sample.int(1e6, 1)  # For final model
+
+# Plug into trainControl
+cv_control <- trainControl(
+  method = "cv",
+  number = num_folds,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final",
+  verboseIter = TRUE,
+  allowParallel = TRUE,
+  seeds = seeds_list
+)
+# Set up grid for GBM parameters
+gbm_grid <- expand.grid(
+  n.trees = c(300),            # number of boosting iterations
+  interaction.depth = c(7),          # max tree depth (complexity)
+  shrinkage = c(0.05),     # learning rate (smaller = slower learning)
+  n.minobsinnode = c(10)               # minimum samples per terminal node
+)
+
+# Train model with caret for cross-validation
+gbm_cv_model <- train(
+  x = X_train_scaled_df,
+  y = y_train_final,
+  method = "gbm",
+  trControl = cv_control,
+  tuneGrid = gbm_grid,
+  metric = "ROC",
+  verbose = FALSE
+)
+
+# Extract best model parameters
+gbm_best_params <- gbm_cv_model$bestTune
+
+cat("\nGBM Best Parameters:\n")
+print(gbm_best_params)
+# Predictions on dev set
+probs_gbm <- predict(gbm_cv_model, newdata = X_dev_scaled_df, type = "prob")[, 2]
+preds_gbm <- ifelse(probs_gbm > 0.5, levels(y_dev)[2], levels(y_dev)[1])
+preds_gbm <- factor(preds_gbm, levels = levels(y_dev))
+
+# Confusion matrix
+conf_mat_gbm <- caret::confusionMatrix(preds_gbm, y_dev, positive = levels(y_dev)[2])
+
+# ROC and AUC
+roc_gbm <- pROC::roc(response = y_dev, predictor = probs_gbm)
+auc_gbm <- pROC::auc(roc_gbm)
+
+# Output AUC to console
+cat("\nGBM AUC:\n")
+print(auc_gbm)
+
+# Store cross-validation results
+cv_results_list[["GBM"]] <- gbm_cv_model$results
+results_gbm <- evaluate_model(gbm_cv_model, X_dev_scaled_df, y_dev, "GBM", prob_method = "prob")
+gbm_final_model <- gbm_cv_model$finalModel
+
+# Extract variable importance
+importance_gbm <- summary(gbm_final_model, plotit = FALSE)
+
+######## Task 4
+
+generate_task4_features <- function(df, text_col = "tweet") {
+  df$contains_whore_and_female <- mapply(function(txt, pdoc)
+    grepl("whore", txt,  TRUE) & pdoc > 0.30,
+    df[[text_col]], df$prop_doctorate)
+  
+  df$contains_hate_women <- grepl("hate", df[[text_col]], TRUE) &
+    grepl("women", df[[text_col]], TRUE)
+  
+  df$contains_bitch_and_male <- mapply(function(txt, pdoc)
+    grepl("bitch", txt, TRUE) & pdoc < 0.20,
+    df[[text_col]], df$prop_doctorate)
+  
+  df$contains_rape_and_white <- as.integer(
+    grepl("rape", df[[text_col]], TRUE) & df$middle_eastern == 0)
+  
+  df$like_women_context <- as.integer(
+    grepl("like",   df[[text_col]], TRUE) &
+      grepl("women",  df[[text_col]], TRUE))
+  
+  df
+}
+
+train_grouped <- generate_task4_features(train_grouped)
+dev_grouped   <- generate_task4_features(dev_grouped)
+
+
+task4_cols <- c(
+  "contains_whore_and_female",
+  "contains_hate_women",
+  "contains_bitch_and_male",
+  "contains_rape_and_white",
+  "like_women_context"
+)
+
+train_grouped[task4_cols] <- lapply(train_grouped[task4_cols], as.integer)
+dev_grouped[task4_cols]   <- lapply(dev_grouped[task4_cols],   as.integer)
+# Set seed for reproducibility
+set.seed(42)
+
+task4_cols <- c(
+  "contains_whore_and_female",
+  "contains_hate_women",
+  "contains_bitch_and_male",
+  "contains_rape_and_white",
+  "like_women_context"
+)
+
+results_ablation <- data.frame()
+
+for (i in 0:length(task4_cols)) {
+  if (i == 0) {
+    current_features <- features
+    label <- "Baseline"
+  } else {
+    f <- task4_cols[i]
+    current_features <- c(features, f)
+    label <- paste("With", f)
+  }
+  
+  cat("\nProcessing:", label, "\n")
+  
+  # --- Preprocessing ---
+  train_mod <- train_grouped %>%
+    dplyr::select(tweet, final_label, all_of(current_features)) %>%
+    rename(sexist = final_label) %>%
+    mutate(across(where(is.numeric),
+                  ~ ifelse(is.na(.) | is.nan(.) | is.infinite(.), 0, .)))
+  
+  dev_mod <- dev_grouped %>%
+    dplyr::select(tweet, final_label, all_of(current_features)) %>%
+    rename(sexist = final_label) %>%
+    mutate(across(where(is.numeric),
+                  ~ ifelse(is.na(.) | is.nan(.) | is.infinite(.), 0, .)))
+  
+  # --- SMOTE ---
+  sm_rec <- recipe(sexist ~ ., data = dplyr::select(train_mod, -tweet)) %>%
+    step_smote(sexist)
+  sm_prep <- prep(sm_rec)
+  train_bal <- bake(sm_prep, new_data = NULL)
+  
+  # --- Remove zero variance variables ---
+  nzv <- caret::nearZeroVar(dplyr::select(train_bal, -sexist), saveMetrics = TRUE)
+  nzv_names <- rownames(nzv[nzv$zeroVar == TRUE, ])
+  if (length(nzv_names) > 0) {
+    train_bal <- dplyr::select(train_bal, -all_of(nzv_names))
+    dev_mod   <- dplyr::select(dev_mod,   -all_of(nzv_names))
+  }
+  
+  # --- CORRECTED Scaling ---
+  # Separate features and target from training set
+  X_train_raw <- train_bal %>% dplyr::select(-sexist)
+  y_train <- factor(train_bal$sexist, levels = c("no", "yes"))
+  
+  # Apply scale and save parameters CORRECTLY
+  mat_train <- scale(X_train_raw)
+  center_v <- attr(mat_train, "scaled:center")
+  scale_v <- attr(mat_train, "scaled:scale")
+  X_train <- as.data.frame(mat_train)
+  
+  # Check if we have the same column names
+  train_columns <- colnames(X_train)
+  
+  # Ensure dev set has the same columns
+  missing_cols <- setdiff(train_columns, colnames(dev_mod))
+  if (length(missing_cols) > 0) {
+    cat("Missing columns in dev for:", label, ":", paste(missing_cols, collapse = ", "), "\n")
+    next
+  }
+  
+  # Select and scale dev set with same parameters
+  X_dev_raw <- dev_mod[, train_columns, drop = FALSE]
+  
+  # Check if center_v and scale_v have same length as columns
+  if (length(center_v) != ncol(X_dev_raw) || length(scale_v) != ncol(X_dev_raw)) {
+    cat("Error: incompatible dimensions for", label, "\n")
+    cat("Dev columns:", ncol(X_dev_raw), "Center:", length(center_v), "Scale:", length(scale_v), "\n")
+    next
+  }
+  
+  X_dev <- tryCatch({
+    as.data.frame(scale(X_dev_raw, center = center_v, scale = scale_v))
+  }, error = function(e) {
+    cat("Error scaling dev set for:", label, "->", e$message, "\n")
+    return(NULL)
+  })
+  
+  if (is.null(X_dev)) next
+  
+  y_dev <- factor(dev_mod$sexist, levels = c("no", "yes"))
+  
+  # --- Training ---
+  model <- tryCatch({
+    train(
+      x = X_train,
+      y = y_train,
+      method = "gbm",
+      trControl = cv_control,
+      tuneGrid = gbm_grid,
+      metric = "ROC",
+      verbose = FALSE
+    )
+  }, error = function(e) {
+    cat("Error training model for:", label, "->", e$message, "\n")
+    return(NULL)
+  })
+  
+  if (!is.null(model)) {
+    tryCatch({
+      # Use your evaluate_model function
+      results <- evaluate_model(
+        model,
+        X_dev,
+        y_dev,
+        model_name = paste0("GBM_", gsub(" ", "_", label)),
+        prob_method = "prob"
+      )
+      
+      # Extract metrics from the results
+      # The evaluate_model function should return or print the metrics
+      # Let's also calculate them manually to ensure we have the values
+      prob <- predict(model, newdata = X_dev, type = "prob")[, 2]
+      pred <- factor(ifelse(prob > 0.5, "yes", "no"), levels = c("no", "yes"))
+      conf <- caret::confusionMatrix(pred, y_dev, positive = "yes")
+      roc <- pROC::roc(y_dev, prob, quiet = TRUE)
+      auc <- pROC::auc(roc)
+      
+      # Extract key metrics
+      f1_binary <- conf$byClass["F1"]
+      sensitivity <- conf$byClass["Sensitivity"]
+      specificity <- conf$byClass["Specificity"]
+      precision_pos <- conf$byClass["Pos Pred Value"]
+      precision_neg <- conf$byClass["Neg Pred Value"]
+      
+      # Handle NAs
+      f1_binary <- ifelse(is.na(f1_binary), 0, f1_binary)
+      precision_pos <- ifelse(is.na(precision_pos), 0, precision_pos)
+      precision_neg <- ifelse(is.na(precision_neg), 0, precision_neg)
+      sensitivity <- ifelse(is.na(sensitivity), 0, sensitivity)
+      specificity <- ifelse(is.na(specificity), 0, specificity)
+      
+      # Calculate macro metrics
+      precision_macro <- (precision_pos + precision_neg) / 2
+      recall_macro <- (sensitivity + specificity) / 2
+      
+      if (precision_macro + recall_macro == 0) {
+        f1_macro <- 0
+      } else {
+        f1_macro <- 2 * (precision_macro * recall_macro) / (precision_macro + recall_macro)
+      }
+      
+      # Create new row
+      new_row <- data.frame(
+        Feature = as.character(label),
+        AUC = as.numeric(auc),
+        F1_Binary = as.numeric(f1_binary),
+        F1_Macro = as.numeric(f1_macro),
+        Precision_Macro = as.numeric(precision_macro),
+        Recall_Macro = as.numeric(recall_macro),
+        stringsAsFactors = FALSE
+      )
+      
+      results_ablation <- rbind(results_ablation, new_row)
+      
+      
+    }, error = function(e) {
+      cat("Error in evaluation for:", label, "->", e$message, "\n")
+    })
+  }
+}
+
+# Display results
+print(results_ablation)

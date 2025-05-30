@@ -12,39 +12,8 @@ library(countrycode)
 library(clusterSim)
 library(clusterCrit)
 library(entropy) 
-library(d)
 # Load Dataset
 df <- read.csv("data/EXIST2025_train.csv")
-
-# Compute Annotator Behavior Features
-annotator_stats <- df %>%
-  group_by(annotator_id) %>%
-  summarise(
-    n_labeled = n(),
-    n_sexist = sum(label_task1_1 == "YES"),
-    n_non_sexist = sum(label_task1_1 == "NO"),
-    sexist_rate = n_sexist / n_labeled
-  )
-
-# Compute Agreement with Majority Labels
-majority_labels <- df %>%
-  group_by(id_EXIST) %>%
-  summarise(
-    majority_label = case_when(
-      sum(label_task1_1 == "YES") > sum(label_task1_1 == "NO") ~ "YES",
-      sum(label_task1_1 == "NO") > sum(label_task1_1 == "YES") ~ "NO",
-      TRUE ~ NA_character_
-    )
-  ) %>% filter(!is.na(majority_label))
-
-agreement <- df %>%
-  inner_join(majority_labels, by = "id_EXIST") %>%
-  mutate(agrees = label_task1_1 == majority_label) %>%
-  group_by(annotator_id) %>%
-  summarise(agreement_rate = mean(agrees))
-
-annotator_stats <- annotator_stats %>%
-  left_join(agreement, by = "annotator_id")
 
 # Add Demographics and Region (keep all annotations)
 df$region <- countrycode(df$country, origin = 'country.name', destination = 'region')
@@ -56,14 +25,9 @@ df_encoded <- fastDummies::dummy_cols(df,
                                       remove_first_dummy = TRUE,
                                       remove_selected_columns = TRUE)
 
-# Merge with annotator stats
-df_encoded <- df_encoded %>%
-  left_join(annotator_stats, by = "annotator_id")
-
 # Select Features
 features <- df_encoded %>%
-  dplyr::select(n_labeled, sexist_rate, agreement_rate, 
-                starts_with("gender_"), starts_with("age_"),
+  dplyr::select(starts_with("gender_"), starts_with("age_"),
                 starts_with("education_"), starts_with("ethnicity_"), 
                 starts_with("region_")) %>%
   drop_na()
