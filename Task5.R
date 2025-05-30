@@ -514,11 +514,21 @@ annotator_filtered <- annotator_final_features %>%
     -age_numeric,
     -ethnicity_numeric,
     -education_numeric,
-    -country_numeric
-  )
+    -country_numeric,
+    -mean_label,
+    -label_variance,
+    -label_entropy
+)
 
 # View the new features
 head(annotator_filtered)
+
+output_filename <- "feature_files/task_5_features_train.csv"
+
+# Save the annotator_filtered dataframe to a CSV file
+write.csv(annotator_filtered, file = output_filename, row.names = FALSE)
+
+cat(paste("\nSuccessfully saved annotator_filtered to", output_filename, "\n"))
 
 # Recommendation System Concepts Used
 #Concept	                                  Feature
@@ -535,3 +545,64 @@ head(annotator_filtered)
 #demographic_knn_bias	User-based CF	Average bias of demographically similar annotators
 #bias_confidence	Similarity weight	Confidence in predictions based on demographic similarity (less = risk)
 #mean_label, label_variance, label_entropy	Behavioral profiling	How predictable, stable, and polarized each annotator is
+
+# The same for the others datasets
+dev_data <- read.csv("data/EXIST2025_dev_labeled.csv", stringsAsFactors = FALSE)
+test_nolabel <- read.csv("data/EXIST_test_nolabel.csv", stringsAsFactors = FALSE)
+
+
+dev_data$label_numeric <- ifelse(dev_data$label_task1_1 == "YES", 1, 0)
+
+dev_enh <- dev_data %>%
+  rename(annotator_id = annotator) %>% 
+  dplyr::left_join(annotator_mapping, by="annotator_id") %>%
+  dplyr::left_join(tweet_mapping,    by="id_EXIST")
+
+test_enh <- test_nolabel %>%
+  rename(annotator_id = annotator) %>% 
+  left_join(annotator_mapping, by = "annotator_id") %>%   
+  left_join(tweet_mapping,    by = "id_EXIST")
+
+
+dev_interactions <- dev_enh %>%
+  group_by(annotator_numeric) %>%
+  summarise(
+    mean_label      = mean(label_numeric),
+    label_variance  = if(n()>1) var(label_numeric) else NA_real_,
+    label_entropy   = -sum(prop.table(table(label_numeric)) * log2(prop.table(table(label_numeric)))),
+    .groups="drop"
+  )
+
+
+dev_features <- annotator_features_demographics %>%
+  dplyr::left_join(dev_interactions, by="annotator_numeric") %>%
+  dplyr::mutate(
+    mean_label     = ifelse(is.na(mean_label), NA, mean_label),
+    label_variance = ifelse(is.na(label_variance), NA, label_variance),
+    label_entropy  = ifelse(is.na(label_entropy), NA, label_entropy)
+  ) %>%
+  dplyr::select(-gender_numeric, -age_numeric, -ethnicity_numeric,
+         -education_numeric, -country_numeric)
+
+dev_features <- dev_features %>%
+  dplyr::select(
+    -annotator_numeric,
+    -mean_label,
+    -label_variance,
+    -label_entropy
+)
+
+
+write.csv(dev_features,"feature_files/task_5_features_dev.csv", row.names = FALSE)
+
+test_features <- annotator_features_demographics %>%
+  dplyr::select(
+    annotator_id, annotator_numeric,
+    predicted_sexist_rate,
+    demographic_knn_bias,
+    bias_confidence,
+    -annotator_numeric
+)
+
+write.csv(test_features,"feature_files/task_5_features_test_nolabel.csv",row.names = FALSE)
+

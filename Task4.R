@@ -84,5 +84,6 @@ arules::inspect(head(rules_no, 10))
 
 # Inspect the top 10 rules sorted by lift
 rules_sorted_by_lift <- sort(rules_demo, by = "lift", decreasing = TRUE)
-arules::inspect(head(rules_sorted_by_lift, 10))
+arules::inspect(head(rules_sorted_by_lift, 25))
+
 
