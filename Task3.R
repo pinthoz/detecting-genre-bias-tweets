@@ -12,7 +12,7 @@ library(countrycode)
 library(clusterSim)
 library(clusterCrit)
 library(entropy) 
-
+library(d)
 # Load Dataset
 df <- read.csv("data/EXIST2025_train.csv")
 
@@ -122,6 +122,9 @@ df_encoded$hc_cluster <- as.factor(hc_clusters)
 # Visualization
 fviz_cluster(list(data = features_scaled, cluster = hc_clusters), main = "Hierarchical Clusters (Ward)")
 
+hc_stats <- cluster.stats(dist_matrix, hc_clusters)
+
+
 # Davies-Bouldin Index
 dbi <- intCriteria(
   as.matrix(features_scaled), 
@@ -177,3 +180,123 @@ comparison_final
 
 # But in 2D, kmeans look more "separated"
 
+df_encoded$kmeans_cluster <- as.factor(kmeans_res$cluster)
+df_encoded$hc_cluster <- as.factor(hc_clusters)
+
+df_clusters <- df_encoded %>%
+  dplyr::select(annotator_id, kmeans_cluster, hc_cluster)
+
+write.csv(df_clusters, "feature_files/features_task_4_train.csv", row.names = FALSE)
+
+
+################## Dev and Test Dataset - Clusters
+
+
+add_missing_columns <- function(df, reference_cols) {
+  missing <- setdiff(reference_cols, names(df))
+  for (col in missing) {
+    df[[col]] <- 0
+  }
+  df <- df[, reference_cols]
+  return(df)
+}
+
+
+# Process test/dev datasets
+process_test_features <- function(df) {
+  if ("annotator" %in% names(df)) {
+    names(df)[names(df) == "annotator"] <- "annotator_id"
+  }
+  if ("age_group" %in% names(df)) {
+    names(df)[names(df) == "age_group"] <- "age"
+  }
+  if ("study_level" %in% names(df)) {
+    names(df)[names(df) == "study_level"] <- "education"
+  }
+  
+  df$region <- countrycode(df$country, origin = 'country.name', destination = 'region')
+  df$region[is.na(df$region)] <- "Other"
+  
+  demo_cols <- c("gender", "age", "education", "ethnicity", "region")
+  available_demo_cols <- demo_cols[demo_cols %in% names(df)]
+  
+  df_encoded <- fastDummies::dummy_cols(df,
+                                        select_columns = available_demo_cols,
+                                        remove_first_dummy = TRUE,
+                                        remove_selected_columns = TRUE)
+  
+  if ("annotator_id" %in% names(df)) {
+    annotator_stats <- df %>%
+      group_by(annotator_id) %>%
+      summarise(n_labeled = n(), .groups = "drop")
+    df_encoded <- df_encoded %>%
+      left_join(annotator_stats, by = "annotator_id")
+  } else {
+    df_encoded$n_labeled <- NA
+  }
+  
+  # These are NA in dev/test, will be removed before clustering
+  df_encoded$sexist_rate <- NA
+  df_encoded$agreement_rate <- NA
+  
+  return(df_encoded)
+}
+
+
+# Load processed training info
+train_mean <- attr(features_scaled, "scaled:center")
+train_sd   <- attr(features_scaled, "scaled:scale")
+cluster_feature_names <- names(train_mean)
+
+# Remove NA columns from clustering
+cluster_feature_names_clean <- setdiff(cluster_feature_names, c("sexist_rate", "agreement_rate"))
+
+# Load and preprocess dev/test
+df_dev <- read.csv("data/EXIST2025_dev_labeled.csv")
+df_test <- read.csv("data/EXIST_test_nolabel.csv")
+
+df_dev_encoded <- process_test_features(df_dev)
+df_test_encoded <- process_test_features(df_test)
+
+# Match features to training
+df_dev_fixed <- add_missing_columns(df_dev_encoded, cluster_feature_names)
+df_test_fixed <- add_missing_columns(df_test_encoded, cluster_feature_names)
+
+# Remove NA-feature columns
+df_dev_fixed <- df_dev_fixed[, cluster_feature_names_clean]
+df_test_fixed <- df_test_fixed[, cluster_feature_names_clean]
+
+# Scale using training mean/sd
+features_dev_scaled <- scale(df_dev_fixed,
+                             center = train_mean[cluster_feature_names_clean],
+                             scale = train_sd[cluster_feature_names_clean])
+
+features_test_scaled <- scale(df_test_fixed,
+                              center = train_mean[cluster_feature_names_clean],
+                              scale = train_sd[cluster_feature_names_clean])
+
+# NEW KMeans clustering (k = 4)
+set.seed(42)
+kmeans_dev <- kmeans(features_dev_scaled, centers = 4, nstart = 25)
+kmeans_test <- kmeans(features_test_scaled, centers = 4, nstart = 25)
+
+df_dev_encoded$kmeans_cluster <- as.factor(kmeans_dev$cluster)
+df_test_encoded$kmeans_cluster <- as.factor(kmeans_test$cluster)
+
+# Hierarchical clustering (k = 9)
+hc_dev <- hclust(dist(features_dev_scaled), method = "ward.D2")
+hc_test <- hclust(dist(features_test_scaled), method = "ward.D2")
+
+df_dev_encoded$hc_cluster <- as.factor(cutree(hc_dev, k = 9))
+df_test_encoded$hc_cluster <- as.factor(cutree(hc_test, k = 9))
+
+
+# Save cluster assignments
+df_clusters_dev <- df_dev_encoded %>%
+  dplyr::select(annotator_id, kmeans_cluster, hc_cluster)
+
+df_clusters_test <- df_test_encoded %>%
+  dplyr::select(annotator_id, kmeans_cluster, hc_cluster)
+
+write.csv(df_clusters_dev, "feature_files/features_task_4_dev.csv", row.names = FALSE)
+write.csv(df_clusters_test, "feature_files/features_task_4_test.csv", row.names = FALSE)
