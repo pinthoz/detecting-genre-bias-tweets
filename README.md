@@ -1,5 +1,12 @@
 # Detecting Genre Bias in Tweets
 
+## Authors
+- Ana Pinto up202105085 
+- Pedro Leitão up202107852
+- Pedro Oliveira up202308236
+
+---
+
 This project investigates **genre bias in tweet annotations** by analyzing annotator behavior and developing predictive models using the EXIST 2025 dataset. Our primary goal is to understand how demographic characteristics influence labeling decisions and to create systems that account for or mitigate potential biases in annotation.
 
 We employ various techniques from machine learning, natural language processing (NLP), and data mining to achieve these objectives, including clustering, association rule mining, and recommendation frameworks.
