@@ -15,6 +15,9 @@ library(dplyr)
 data <- read.csv("data/EXIST2025_train.csv", stringsAsFactors = FALSE)
 data$label_numeric <- ifelse(data$label_task1_1 == "YES", 1, 0)
 
+dev_data <- read.csv("data/EXIST2025_dev_labeled.csv", stringsAsFactors = FALSE)
+test_nolabel <- read.csv("data/EXIST_test_nolabel.csv", stringsAsFactors = FALSE)
+
 # Create comprehensive annotator and tweet mappings
 annotator_mapping <- data %>%
   dplyr::select(annotator_id) %>%
@@ -400,12 +403,23 @@ grid.arrange(p1, p2, p3, ncol = 2)
 # --- 11. Feature Integration for Main Classifier ---
 # --- Demographic Feature Extraction for Annotators ---
 
-annotator_demographics <- data %>%
-  dplyr::select(annotator_id, gender, age, ethnicity, education, country) %>%
+# Standardize and merge all annotator demographic info
+data_fixed <- data %>%
+  select(annotator_id, gender, age, ethnicity, education, country)
+
+dev_fixed <- dev_data %>%
+  rename(annotator_id = annotator, age = age_group, education = study_level) %>%
+  select(annotator_id, gender, age, ethnicity, education, country)
+
+test_fixed <- test_nolabel %>%
+  rename(annotator_id = annotator, age = age_group, education = study_level) %>%
+  select(annotator_id, gender, age, ethnicity, education, country)
+
+all_annotators <- bind_rows(data_fixed, dev_fixed, test_fixed) %>%
   distinct()
 
 # Encode demographics numerically
-annotator_demo_encoded <- annotator_demographics %>%
+annotator_features_demographics <- all_annotators %>%
   mutate(
     gender_numeric = as.numeric(factor(gender)),
     age_numeric = case_when(
@@ -418,191 +432,163 @@ annotator_demo_encoded <- annotator_demographics %>%
     education_numeric = as.numeric(factor(education)),
     country_numeric = as.numeric(factor(country))
   ) %>%
-  dplyr::select(annotator_id, gender_numeric, age_numeric, ethnicity_numeric, education_numeric, country_numeric)
+  left_join(annotator_mapping, by = "annotator_id")
 
-# Join with annotator mapping to get numeric IDs
-annotator_features_demographics <- annotator_mapping %>%
-  left_join(annotator_demo_encoded, by = "annotator_id")
-
+# Fit regression model to predict bias from demographics
 annotator_bias_model_data <- global_annotator_profiles %>%
-  left_join(annotator_features_demographics, by = "annotator_id")
-
-# Drop NAs and fit a linear model to predict bias from demographics
-annotator_bias_model_data <- annotator_bias_model_data %>%
+  left_join(annotator_features_demographics, by = "annotator_id") %>%
   filter(!is.na(sexist_rate), !is.na(gender_numeric), !is.na(age_numeric))
 
-# Fit a regression model to predict annotator bias (sexist_rate) from demographics
 annotator_bias_model <- lm(sexist_rate ~ gender_numeric + age_numeric + ethnicity_numeric +
                              education_numeric + country_numeric, data = annotator_bias_model_data)
 
-# View model summary (optional)
-summary(annotator_bias_model)
-
-# --- Predict expected bias from demographics (can be used for cold-start annotators) ---
+# Predict bias
 annotator_features_demographics$predicted_sexist_rate <- predict(annotator_bias_model, newdata = annotator_features_demographics)
-
-# Clip predictions between 0 and 1
 annotator_features_demographics$predicted_sexist_rate <- pmin(pmax(annotator_features_demographics$predicted_sexist_rate, 0), 1)
 
-# Join bias info with demographic features
-annotator_bias_model_data <- global_annotator_profiles %>%
-  left_join(annotator_features_demographics, by = "annotator_id")
+# Calculate demographic similarity matrix
+demo_matrix <- annotator_features_demographics %>%
+  select(gender_numeric, age_numeric, ethnicity_numeric, education_numeric, country_numeric) %>%
+  as.matrix()
+rownames(demo_matrix) <- annotator_features_demographics$annotator_numeric
 
-# Drop NAs and fit a linear model to predict bias from demographics
-annotator_bias_model_data <- annotator_bias_model_data %>%
-  filter(!is.na(sexist_rate), !is.na(gender_numeric), !is.na(age_numeric))
+demo_dist_matrix <- as.matrix(dist(demo_matrix, method = "euclidean"))
 
-# Fit a regression model to predict annotator bias (sexist_rate) from demographics
-annotator_bias_model <- lm(sexist_rate ~ gender_numeric + age_numeric + ethnicity_numeric +
-                             education_numeric + country_numeric, data = annotator_bias_model_data)
+# KNN-based demographic bias
+k <- 4
+annotator_features_demographics$demographic_knn_bias <- sapply(1:nrow(demo_dist_matrix), function(i) {
+  neighbor_ids <- order(demo_dist_matrix[i, ])[2:(k + 1)]
+  mean(annotator_features_demographics$predicted_sexist_rate[neighbor_ids], na.rm = TRUE)
+})
 
-# View model summary (optional)
-summary(annotator_bias_model)
+# Confidence in predicted bias
+annotator_features_demographics$bias_confidence <- apply(demo_dist_matrix, 1, function(dist_row) {
+  1 / (1 + mean(dist_row, na.rm = TRUE))
+})
 
-# --- Predict expected bias from demographics (can be used for cold-start annotators) ---
-annotator_features_demographics$predicted_sexist_rate <- predict(annotator_bias_model, newdata = annotator_features_demographics)
 
-# Clip predictions between 0 and 1
-annotator_features_demographics$predicted_sexist_rate <- pmin(pmax(annotator_features_demographics$predicted_sexist_rate, 0), 1)
-
-# View enhanced annotator profile
-head(annotator_features_demographics)
-
-# 1. Annotator-specific interaction richness
-annotator_interactions <- data_enhanced %>%
+# === TRAIN features ===
+annotator_interactions_train <- train_data %>%
   group_by(annotator_numeric) %>%
   summarise(
-    mean_label = mean(label_numeric),
-    label_variance = if(n() > 1) var(label_numeric) else NA_real_,
-    label_entropy = -sum(prop.table(table(label_numeric)) * log2(prop.table(table(label_numeric)))),
+    mean_label      = mean(label_numeric),
+    label_variance  = if(n() > 1) var(label_numeric) else NA_real_,
+    label_entropy   = -sum(prop.table(table(label_numeric)) * log2(prop.table(table(label_numeric)))),
     .groups = "drop"
   )
 
-# 2. Create demographic similarity matrix (Euclidean in demo feature space)
-annotator_demo_matrix <- annotator_features_demographics %>%
-  dplyr::select(gender_numeric, age_numeric, ethnicity_numeric, education_numeric, country_numeric) %>%
-  as.matrix()
-rownames(annotator_demo_matrix) <- annotator_features_demographics$annotator_numeric
+train_annotators <- unique(train_data$annotator_id)
 
-# Compute pairwise distance (you can use cosine or euclidean)
-demo_dist_matrix <- as.matrix(dist(annotator_demo_matrix, method = "euclidean"))
+train_features <- annotator_features_demographics %>%
+  filter(annotator_id %in% train_annotators) %>%
+  left_join(annotator_interactions_train, by = "annotator_numeric") %>%
+  select(
+    annotator_id,
+    predicted_sexist_rate,
+    demographic_knn_bias,
+    bias_confidence,
+    mean_label,
+    label_variance,
+    label_entropy
+  )
 
-# 3. For each annotator, compute mean predicted_sexist_rate of k nearest demographic neighbors
-k <- 4
-knn_bias_feature <- sapply(1:nrow(demo_dist_matrix), function(i) {
-  neighbor_ids <- order(demo_dist_matrix[i, ])[2:(k + 1)]  # skip self (first one)
-  mean(annotator_features_demographics$predicted_sexist_rate[neighbor_ids], na.rm = TRUE)
-})
-annotator_features_demographics$demographic_knn_bias <- knn_bias_feature
-
-
-# 4. Confidence in predicted bias (based on similarity agreement)
-bias_confidence <- apply(demo_dist_matrix, 1, function(dist_row) {
-  1 / (1 + mean(dist_row, na.rm = TRUE))
-})
-annotator_features_demographics$bias_confidence <- bias_confidence
-
-# Combine everything into one annotator feature set
-annotator_final_features <- annotator_features_demographics %>%
-  left_join(annotator_interactions, by = "annotator_numeric")
+write.csv(train_features, "feature_files/task_5_features_train.csv", row.names = FALSE)
+cat("✔️ Saved: task_5_features_train.csv\n")
 
 
-annotator_filtered <- annotator_final_features %>%
-  dplyr::select(
-    -annotator_numeric,
-    -gender_numeric,
-    -age_numeric,
-    -ethnicity_numeric,
-    -education_numeric,
-    -country_numeric,
-    -mean_label,
-    -label_variance,
-    -label_entropy
-)
-
-# View the new features
-head(annotator_filtered)
-
-output_filename <- "feature_files/task_5_features_train.csv"
-
-# Save the annotator_filtered dataframe to a CSV file
-write.csv(annotator_filtered, file = output_filename, row.names = FALSE)
-
-cat(paste("\nSuccessfully saved annotator_filtered to", output_filename, "\n"))
-
-# Recommendation System Concepts Used
-#Concept	                                  Feature
-#Content-Based Filtering        	predicted_sexist_rate from demographics
-#User-Based CF	                         demographic_knn_bias
-#Confidence                           Modeling	bias_confidence
-#Hybrid RS	                     Blending demographic + CF + tweet info
-#Cold Start Solutions	                Demographics → predictions
-
-
-# Features Created from Recommender System Concepts
-#Feature Name	RS Concept	Meaning
-#predicted_sexist_rate	Content-based RS	Estimate annotator bias using only demographic features
-#demographic_knn_bias	User-based CF	Average bias of demographically similar annotators
-#bias_confidence	Similarity weight	Confidence in predictions based on demographic similarity (less = risk)
-#mean_label, label_variance, label_entropy	Behavioral profiling	How predictable, stable, and polarized each annotator is
-
-# The same for the others datasets
-dev_data <- read.csv("data/EXIST2025_dev_labeled.csv", stringsAsFactors = FALSE)
-test_nolabel <- read.csv("data/EXIST_test_nolabel.csv", stringsAsFactors = FALSE)
-
-
-dev_data$label_numeric <- ifelse(dev_data$label_task1_1 == "YES", 1, 0)
-
+# === DEV features ===
 dev_enh <- dev_data %>%
-  rename(annotator_id = annotator) %>% 
-  dplyr::left_join(annotator_mapping, by="annotator_id") %>%
-  dplyr::left_join(tweet_mapping,    by="id_EXIST")
-
-test_enh <- test_nolabel %>%
-  rename(annotator_id = annotator) %>% 
-  left_join(annotator_mapping, by = "annotator_id") %>%   
-  left_join(tweet_mapping,    by = "id_EXIST")
-
+  rename(annotator_id = annotator, age = age_group, education = study_level) %>%
+  left_join(annotator_mapping, by = "annotator_id") %>%
+  left_join(tweet_mapping, by = "id_EXIST") %>%
+  mutate(label_numeric = ifelse(label_task1_1 == "YES", 1, 0))
 
 dev_interactions <- dev_enh %>%
   group_by(annotator_numeric) %>%
   summarise(
     mean_label      = mean(label_numeric),
-    label_variance  = if(n()>1) var(label_numeric) else NA_real_,
+    label_variance  = if(n() > 1) var(label_numeric) else NA_real_,
     label_entropy   = -sum(prop.table(table(label_numeric)) * log2(prop.table(table(label_numeric)))),
-    .groups="drop"
+    .groups = "drop"
   )
 
+dev_annotators <- unique(dev_enh$annotator_id)
 
 dev_features <- annotator_features_demographics %>%
-  dplyr::left_join(dev_interactions, by="annotator_numeric") %>%
-  dplyr::mutate(
-    mean_label     = ifelse(is.na(mean_label), NA, mean_label),
-    label_variance = ifelse(is.na(label_variance), NA, label_variance),
-    label_entropy  = ifelse(is.na(label_entropy), NA, label_entropy)
-  ) %>%
-  dplyr::select(-gender_numeric, -age_numeric, -ethnicity_numeric,
-         -education_numeric, -country_numeric)
-
-dev_features <- dev_features %>%
-  dplyr::select(
-    -annotator_numeric,
-    -mean_label,
-    -label_variance,
-    -label_entropy
-)
-
-
-write.csv(dev_features,"feature_files/task_5_features_dev.csv", row.names = FALSE)
-
-test_features <- annotator_features_demographics %>%
-  dplyr::select(
-    annotator_id, annotator_numeric,
+  filter(annotator_id %in% dev_annotators) %>%
+  left_join(dev_interactions, by = "annotator_numeric") %>%
+  select(
+    annotator_id,
     predicted_sexist_rate,
     demographic_knn_bias,
     bias_confidence,
-    -annotator_numeric
-)
+    mean_label,
+    label_variance,
+    label_entropy
+  )
 
-write.csv(test_features,"feature_files/task_5_features_test_nolabel.csv",row.names = FALSE)
+write.csv(dev_features, "feature_files/task_5_features_dev.csv", row.names = FALSE)
+cat("✔️ Saved: task_5_features_dev.csv\n")
 
+
+# === TEST features ===
+test_enh <- test_nolabel %>%
+  rename(annotator_id = annotator, age = age_group, education = study_level) %>%
+  left_join(annotator_mapping, by = "annotator_id") %>%
+  left_join(tweet_mapping, by = "id_EXIST")
+
+test_annotators <- unique(test_enh$annotator_id)
+
+test_features <- annotator_features_demographics %>%
+  filter(annotator_id %in% test_annotators) %>%
+  select(
+    annotator_id,
+    predicted_sexist_rate,
+    demographic_knn_bias,
+    bias_confidence
+  )
+
+# Add only mean_label, label_variance, and label_entropy from dev_features
+test_features <- test_features %>%
+  left_join(
+    dev_features %>% select(annotator_id, mean_label, label_variance, label_entropy),
+    by = "annotator_id"
+  )
+
+# Overwrite the CSV with the updated test features
+write.csv(test_features, "feature_files/task_5_features_test_nolabel.csv", row.names = FALSE)
+cat("✔️ Saved: task_5_features_test_nolabel.csv\n")
+
+################################################
+
+annotators_dev <- unique(dev_data$annotator)
+annotators_test_nolabel <- unique(test_nolabel$annotator)
+
+# Annotators present in dev_data but not in test_nolabel
+only_dev <- setdiff(annotators_dev, annotators_test_nolabel)
+
+# Annotators present in test_nolabel but not in dev_data
+only_test_nolabel <- setdiff(annotators_test_nolabel, annotators_dev)
+
+if (length(only_dev) > 0 | length(only_test_nolabel) > 0) {
+  cat("Differences found:\n")
+  
+  if (length(only_dev) > 0) {
+    cat("\nAnnotators only in 'dev_data':\n")
+    print(only_dev)
+  } else {
+    cat("\nAll annotators from 'dev_data' are present in 'test_nolabel'.\n")
+  }
+  
+  if (length(only_test_nolabel) > 0) {
+    cat("\nAnnotators only in 'test_nolabel':\n")
+    print(only_test_nolabel)
+  } else {
+    cat("\nAll annotators from 'test_nolabel' are present in 'dev_data'.\n")
+  }
+  
+} else {
+  cat("The datasets have exactly the same annotators.\n")
+}
+
+########

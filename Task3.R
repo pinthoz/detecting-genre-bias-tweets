@@ -59,36 +59,6 @@ cat("Average silhouette width:", kmeans_stats$avg.silwidth, "\n")
 cat("Calinski-Harabasz index:", kmeans_stats$ch, "\n")
 cat("Dunn index:", kmeans_stats$dunn, "\n")
 
-# Hierarchical Clustering
-dist_matrix <- dist(features_scaled)
-hc_res <- hclust(dist_matrix, method = "ward.D2")
-
-# Evaluate silhouette for k = 2 to 10
-sil_width_hc <- function(k) {
-  clusters <- cutree(hc_res, k = k)
-  mean(silhouette(clusters, dist_matrix)[, 3])
-}
-
-sil_scores_hc <- sapply(2:10, sil_width_hc)
-
-# Plot silhouette scores
-plot(2:10, sil_scores_hc, type = "b", 
-     xlab = "Number of Clusters", ylab = "Average Silhouette Width",
-     main = "Silhouette Method for Optimal K (Hierarchical)")
-
-# Dendrogram
-plot(hc_res, labels = FALSE, main = "Dendrogram (Ward's Method)")
-
-# Cut into 9 clusters
-hc_clusters <- cutree(hc_res, k = 9)
-df_encoded$hc_cluster <- as.factor(hc_clusters)
-
-# Visualization
-fviz_cluster(list(data = features_scaled, cluster = hc_clusters), main = "Hierarchical Clusters (Ward)")
-
-hc_stats <- cluster.stats(dist_matrix, hc_clusters)
-
-
 # Davies-Bouldin Index
 dbi <- intCriteria(
   as.matrix(features_scaled), 
@@ -96,14 +66,8 @@ dbi <- intCriteria(
   c("Davies_Bouldin")
 )
 
-dbi_hc <- intCriteria(
-  as.matrix(features_scaled),
-  as.integer(hc_clusters),
-  c("Davies_Bouldin")
-)
 
 cat("Davies-Bouldin Index (KMeans):", dbi$davies_bouldin, "\n")
-cat("Davies-Bouldin Index (Hierarchical):", dbi_hc$davies_bouldin, "\n")
 
 # Intra-cluster distance
 intra_dist <- function(data, clusters) {
@@ -118,10 +82,8 @@ intra_dist <- function(data, clusters) {
 }
 
 kmeans_intra_dist <- intra_dist(features_scaled, kmeans_res$cluster)
-hc_intra_dist <- intra_dist(features_scaled, hc_clusters)
 
 cat("Intra-cluster distance (KMeans):", kmeans_intra_dist, "\n")
-cat("Intra-cluster distance (Hierarchical):", hc_intra_dist, "\n")
 
 # ------------------------------
 # FINAL COMPARISON & SELECTION
@@ -134,9 +96,6 @@ comparison_final <- tibble(
   KMeans = c(kmeans_stats$within.cluster.ss, kmeans_stats$avg.silwidth, 
              kmeans_stats$ch, kmeans_stats$dunn, 
              dbi$davies_bouldin, kmeans_intra_dist),
-  Hierarchical = c(hc_stats$within.cluster.ss, hc_stats$avg.silwidth, 
-                   hc_stats$ch, hc_stats$dunn, 
-                   dbi_hc$davies_bouldin, hc_intra_dist)
 )
 
 cat("Final Comparison of Clustering Methods:\n")
@@ -145,12 +104,10 @@ comparison_final
 # But in 2D, kmeans look more "separated"
 
 df_encoded$kmeans_cluster <- as.factor(kmeans_res$cluster)
-df_encoded$hc_cluster <- as.factor(hc_clusters)
-
 df_clusters <- df_encoded %>%
-  dplyr::select(annotator_id, kmeans_cluster, hc_cluster)
+  dplyr::select(annotator_id, kmeans_cluster)
 
-write.csv(df_clusters, "feature_files/features_task_4_train.csv", row.names = FALSE)
+write.csv(df_clusters, "data/features_task_3_train.csv", row.names = FALSE)
 
 
 ################## Dev and Test Dataset - Clusters
@@ -240,27 +197,29 @@ features_test_scaled <- scale(df_test_fixed,
                               scale = train_sd[cluster_feature_names_clean])
 
 # NEW KMeans clustering (k = 4)
-set.seed(42)
-kmeans_dev <- kmeans(features_dev_scaled, centers = 4, nstart = 25)
-kmeans_test <- kmeans(features_test_scaled, centers = 4, nstart = 25)
+# Assign each point to nearest train centroid
+assign_to_clusters <- function(features_scaled, centroids) {
+  dists <- as.matrix(dist(rbind(centroids, features_scaled)))
+  dists <- dists[-seq_len(nrow(centroids)), seq_len(nrow(centroids))]
+  max.col(-dists)  # index of nearest centroid
+}
 
-df_dev_encoded$kmeans_cluster <- as.factor(kmeans_dev$cluster)
-df_test_encoded$kmeans_cluster <- as.factor(kmeans_test$cluster)
+centroids_train <- kmeans_res$centers
 
-# Hierarchical clustering (k = 9)
-hc_dev <- hclust(dist(features_dev_scaled), method = "ward.D2")
-hc_test <- hclust(dist(features_test_scaled), method = "ward.D2")
+kmeans_dev_cluster <- assign_to_clusters(features_dev_scaled, centroids_train)
+kmeans_test_cluster <- assign_to_clusters(features_test_scaled, centroids_train)
 
-df_dev_encoded$hc_cluster <- as.factor(cutree(hc_dev, k = 9))
-df_test_encoded$hc_cluster <- as.factor(cutree(hc_test, k = 9))
+df_dev_encoded$kmeans_cluster <- as.factor(kmeans_dev_cluster)
+df_test_encoded$kmeans_cluster <- as.factor(kmeans_test_cluster)
+
 
 
 # Save cluster assignments
 df_clusters_dev <- df_dev_encoded %>%
-  dplyr::select(annotator_id, kmeans_cluster, hc_cluster)
+  dplyr::select(annotator_id, kmeans_cluster)
 
 df_clusters_test <- df_test_encoded %>%
-  dplyr::select(annotator_id, kmeans_cluster, hc_cluster)
+  dplyr::select(annotator_id, kmeans_cluster)
 
-write.csv(df_clusters_dev, "feature_files/features_task_4_dev.csv", row.names = FALSE)
-write.csv(df_clusters_test, "feature_files/features_task_4_test.csv", row.names = FALSE)
+write.csv(df_clusters_dev, "data/features_task_3_dev.csv", row.names = FALSE)
+write.csv(df_clusters_test, "data/features_task_3_test.csv", row.names = FALSE)
