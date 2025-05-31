@@ -26,6 +26,10 @@ We employ various techniques from machine learning, natural language processing 
 
 ### 🔍 Analytical Tasks
 
+- **`Main.R`** → *Main Script - Classification & Modeling*  
+  This script orchestrates the entire classification pipeline, including data loading, preprocessing, feature engineering, model training, and evaluation. It integrates the results from Tasks 3, 4, and 5 to enhance model performance and interpretability in the base of Task 1 -> *(Task 6: Integrating Insights to Improve the Classifier)*
+
+
 - **`Task3.R`** → *Annotator Clustering*  
   Clusters annotators based on labeling behavior using unsupervised learning. This helps uncover trends among annotators, such as consistent over- or under-labeling of bias, and explores relationships with demographic features (e.g., age, gender, country).
 
@@ -34,9 +38,6 @@ We employ various techniques from machine learning, natural language processing 
 
 - **`Task5.R`** → *Recommendation System & Advanced Analysis*  
   Builds on the insights from Tasks 3 and 4 to propose recommendation-style or predictive models. These models aim to predict likely annotations based on annotator profiles or to recommend annotation adjustments.
-
-- **`code_task2.R`** → *Experimental Task 2*  
-  Early-stage or experimental scripts related to feature engineering and preliminary analysis. *(To be updated or deprecated in future versions.)*
 
 
 ### ⚙️ Additional Files
@@ -54,6 +55,10 @@ The `data/` folder contains all essential datasets used throughout the project:
 - **`EXIST2025_dev_labeled.csv`** → Development dataset with known labels for validation and testing.
 - **`EXIST2025_dev_unlabeled.csv`** → Unlabeled set for exploratory analysis or pseudo-labeling approaches.
 
+The `feature_files/` folder contains engineered features derived from the raw data, such as:
+- **`features_task_3_<xxx>.csv`** → Features extracted in Task 3 for clustering annotators.
+- **`task_5_features_<xxx>.csv`** → Features extracted in Task 5 using concepts of recommendation systems.
+
 ---
 
 ## 🧪 Technical Details
@@ -62,11 +67,3 @@ The `data/` folder contains all essential datasets used throughout the project:
 - **Libraries**: `tidyverse`, `cluster`, `arules`, `ggplot2`, and other relevant statistical/NLP packages
 - **Techniques**: Clustering, Association Rule Mining, Recommender Systems, Feature Engineering, Demographic Analysis
 
----
-
-## 💾 Environment & Session Files
-
-- **`.RData`** and **`.Rhistory`**  
-  R session and history files preserving environment variables and command history for reproducibility.
-
----
